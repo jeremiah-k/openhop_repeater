@@ -4268,6 +4268,19 @@ class SQLiteHandler:
             logger.error(f"Failed to push companion message: {e}")
             return False
 
+    @staticmethod
+    def _companion_message_from_row(row: sqlite3.Row) -> Dict:
+        """Decode a ``companion_messages`` row into the message dict shape."""
+        msg = dict(row)
+        msg.pop("id", None)
+        prefix = msg.get("sender_prefix") or ""
+        msg["sender_prefix"] = bytes.fromhex(prefix) if isinstance(prefix, str) else bytes(prefix)
+        msg["snr"] = float(msg.get("snr") or 0.0)
+        msg["rssi"] = int(msg.get("rssi") or 0)
+        msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
+        msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
+        return msg
+
     def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
         """Remove and return the oldest message from the companion's queue."""
         try:
@@ -4286,15 +4299,56 @@ class SQLiteHandler:
                 row = cursor.fetchone()
                 if not row:
                     return None
-                msg = dict(row)
-                msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
-                msg["snr"] = float(msg.get("snr") or 0.0)
-                msg["rssi"] = int(msg.get("rssi") or 0)
-                msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
-                msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
-                conn.execute("DELETE FROM companion_messages WHERE id = ?", (msg["id"],))
+                msg = self._companion_message_from_row(row)
+                conn.execute("DELETE FROM companion_messages WHERE id = ?", (row["id"],))
                 conn.commit()
-                return {k: v for k, v in msg.items() if k != "id"}
+                return msg
         except Exception as e:
             logger.error(f"Failed to pop companion message: {e}")
             return None
+
+    def companion_peek_message(self, companion_hash: str) -> Optional[tuple[int, Dict]]:
+        """Return the oldest queued message *without* removing it.
+
+        Returns ``(row_id, message)`` so the caller can delete exactly that
+        row once the message has really been handed to the client, or ``None``
+        when the queue is empty (or the read failed).
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
+                           path_len, sender_prefix, snr, rssi, channel_data_type,
+                           channel_data_payload
+                    FROM companion_messages WHERE companion_hash = ?
+                    ORDER BY id ASC LIMIT 1
+                """,
+                    (companion_hash,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return int(row["id"]), self._companion_message_from_row(row)
+        except Exception as e:
+            logger.error(f"Failed to peek companion message: {e}")
+            return None
+
+    def companion_delete_message(self, companion_hash: str, message_id: int) -> bool:
+        """Delete one queued message by row id.
+
+        Returns True when a row was removed, False when the row was already
+        gone (or the delete failed).
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM companion_messages WHERE id = ? AND companion_hash = ?",
+                    (message_id, companion_hash),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete companion message: {e}")
+            return False

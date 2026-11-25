@@ -125,8 +125,9 @@ def test_frame_round_trip_is_byte_identical(tmp_path, msg_dict):
     original_frame = fs._build_message_frame(_qm_from_dict(msg_dict))
 
     assert h.companion_push_message(_HASH, dict(msg_dict))
-    rebuilt = fs._sync_next_from_persistence()
-    assert rebuilt is not None
+    peeked = fs._sync_next_from_persistence()
+    assert peeked is not None
+    _, rebuilt = peeked
     rebuilt_frame = fs._build_message_frame(rebuilt)
 
     assert rebuilt_frame == original_frame
@@ -139,7 +140,9 @@ def test_channel_data_survives_as_binary_frame_not_empty_text(tmp_path):
     fs = _frame_server(h)
 
     assert h.companion_push_message(_HASH, dict(_CHANNEL_DATA))
-    rebuilt = fs._sync_next_from_persistence()
+    peeked = fs._sync_next_from_persistence()
+    assert peeked is not None
+    _, rebuilt = peeked
 
     assert rebuilt.channel_data_type == 0x0102
     assert rebuilt.channel_data_payload == b"\x01\x02\x03\xff\x10"

@@ -455,17 +455,23 @@ class TestSenderPrefixPersistence:
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
-        fs.sqlite_handler.companion_pop_message.return_value = {
-            "sender_key": b"\x01" * 32,
-            "txt_type": 2,
-            "timestamp": 42,
-            "text": "signed post",
-            "is_channel": 0,
-            "channel_idx": 0,
-            "path_len": 0,
-            "sender_prefix": self.PREFIX,
-        }
-        msg = fs._sync_next_from_persistence()
+        fs.sqlite_handler.companion_peek_message.return_value = (
+            7,
+            {
+                "sender_key": b"\x01" * 32,
+                "txt_type": 2,
+                "timestamp": 42,
+                "text": "signed post",
+                "is_channel": 0,
+                "channel_idx": 0,
+                "path_len": 0,
+                "sender_prefix": self.PREFIX,
+            },
+        )
+        peeked = fs._sync_next_from_persistence()
+        assert peeked is not None
+        row_id, msg = peeked
+        assert row_id == 7
         assert msg.sender_prefix == self.PREFIX
 
 

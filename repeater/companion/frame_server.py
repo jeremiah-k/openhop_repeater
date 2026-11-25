@@ -155,17 +155,24 @@ class CompanionFrameServer(_BaseFrameServer):
             return
         self.bridge.message_queue.remove(queue_entry)
 
-    def _sync_next_from_persistence(self) -> Optional[QueuedMessage]:
-        """Retrieve next message from SQLite when bridge queue is empty."""
+    def _sync_next_from_persistence(self) -> Optional[tuple[int, QueuedMessage]]:
+        """Peek the next persisted message when the bridge queue is empty.
+
+        The row is *not* removed here: it is deleted by
+        :meth:`_cmd_sync_next_message` once the frame has really been queued
+        for the client.  Returns ``(row_id, message)`` so exactly that row can
+        be deleted afterwards.
+        """
         if not self.sqlite_handler:
             return None
-        msg_dict = self.sqlite_handler.companion_pop_message(self.companion_hash)
-        if not msg_dict:
+        peeked = self.sqlite_handler.companion_peek_message(self.companion_hash)
+        if not peeked:
             return None
+        row_id, msg_dict = peeked
         sender_prefix = msg_dict.get("sender_prefix", b"")
         if isinstance(sender_prefix, str):
             sender_prefix = bytes.fromhex(sender_prefix) if sender_prefix else b""
-        return QueuedMessage(
+        return row_id, QueuedMessage(
             sender_key=msg_dict.get("sender_key", b""),
             txt_type=msg_dict.get("txt_type", 0),
             timestamp=msg_dict.get("timestamp", 0),
@@ -185,14 +192,42 @@ class CompanionFrameServer(_BaseFrameServer):
     # -----------------------------------------------------------------
 
     async def _cmd_sync_next_message(self, data: bytes) -> None:
-        """Sync next message; run persistence read in thread so SQLite does not block."""
+        """Sync next message; run persistence I/O in a thread so SQLite does not block.
+
+        The persisted row is deleted only after the frame has actually been
+        queued for the client.  When the enqueue fails (no client attached, a
+        payload that does not fit, or a full write queue) the row stays in
+        SQLite and the message is delivered by a later sync attempt instead of
+        being lost.
+
+        Remaining boundary: the companion protocol has no end-to-end
+        acknowledgement.  Once the frame is queued the delivery is
+        *at-most-once* — a client that disconnects before reading the frame
+        loses that copy, and the message is not replayed.
+        """
         msg = self.bridge.sync_next_message()
+        row_id = None
         if msg is None:
-            msg = await asyncio.to_thread(self._sync_next_from_persistence)
-        if msg is None:
+            peeked = await asyncio.to_thread(self._sync_next_from_persistence)
+            if peeked is None:
+                self._write_frame(bytes([RESP_CODE_NO_MORE_MESSAGES]))
+                return
+            row_id, msg = peeked
+        frame = self._build_message_frame(msg)
+        if not self._write_frame(frame):
+            # The frame did not reach the client: keep the row for a retry.
+            logger.warning(
+                "Companion %s: message frame could not be queued; keeping it queued",
+                self.companion_hash,
+            )
             self._write_frame(bytes([RESP_CODE_NO_MORE_MESSAGES]))
             return
-        self._write_frame(self._build_message_frame(msg))
+        if row_id is not None:
+            await asyncio.to_thread(
+                self.sqlite_handler.companion_delete_message,
+                self.companion_hash,
+                row_id,
+            )
 
     @staticmethod
     def _contact_to_dict(c) -> dict:

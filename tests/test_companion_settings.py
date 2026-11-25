@@ -554,7 +554,7 @@ class TestPersistSkipWhenOff:
         # No queue entry to stamp, so the row is written without an arrival
         # number and falls back to its row order.
         fs.sqlite_handler.companion_push_message.assert_called_once_with(
-            "0x01", {"text": "x"}, 7, None
+            "0x01", {"text": "x"}, 7, None, busy_timeout_ms=fs._STORE_BUSY_TIMEOUT_MS
         )
 
     def test_keeps_memory_message_when_sqlite_rejects_it(self):

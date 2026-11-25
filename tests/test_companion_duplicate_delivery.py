@@ -45,26 +45,6 @@ def _server(handler: SQLiteHandler, bridge: _Bridge) -> CompanionFrameServer:
     return fs
 
 
-class _OpenWriter:
-    """A live attached-transport double for the admission gate."""
-
-    def write(self, _data):
-        return None
-
-    async def drain(self):
-        return None
-
-    def close(self):
-        return None
-
-    async def wait_closed(self):
-        return None
-
-    def is_closing(self):
-        return False
-
-
-
 def _msg(text: str, key_byte: bytes, packet_hash: str, *, is_channel: bool = False):
     """A queue entry and the matching persistence dict for one message."""
     entry = QueuedMessage(

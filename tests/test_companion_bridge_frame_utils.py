@@ -160,7 +160,15 @@ async def test_frame_server_persistence_paths_and_stop():
 
         entry = SimpleNamespace()  # bears __dict__, like a real QueuedMessage
         await srv._persist_companion_message({"text": "x"}, entry)
-        sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"}, None, 1)
+        # The entry bears no admission number (a bare namespace), so the row
+        # is written without one and falls back to its row order at read time.
+        sqlite.companion_push_message.assert_called_once_with(
+            "h",
+            {"text": "x"},
+            None,
+            None,
+            busy_timeout_ms=CompanionFrameServer._STORE_BUSY_TIMEOUT_MS,
+        )
         bridge.message_queue.remove.assert_called_once_with(entry)
 
         peeked = srv._sync_next_from_persistence()
@@ -172,7 +180,9 @@ async def test_frame_server_persistence_paths_and_stop():
         await srv._cmd_sync_next_message(b"")
         srv._write_frame.assert_called_once_with(b"frame")
         # The row is only deleted once the frame has been queued.
-        sqlite.companion_delete_message.assert_called_once_with("h", 11)
+        sqlite.companion_delete_message.assert_called_once_with(
+            "h", 11, CompanionFrameServer._STORE_BUSY_TIMEOUT_MS
+        )
 
         contact = SimpleNamespace(
             public_key=b"\x01\x02",
@@ -231,14 +241,14 @@ async def test_restart_queue_rows_are_delivered_once_from_sqlite():
             self.peeks = 0
             self.deleted = []
 
-        def companion_peek_message(self, companion_hash):
+        def companion_peek_message(self, companion_hash, busy_timeout_ms=None):
             self.peeks += 1
             if not self.rows:
                 return None
             row_id, msg = self.rows[0]
             return row_id, dict(msg)
 
-        def companion_delete_message(self, companion_hash, row_id):
+        def companion_delete_message(self, companion_hash, row_id, busy_timeout_ms=None):
             for index, (rid, _) in enumerate(self.rows):
                 if rid == row_id:
                     self.rows.pop(index)

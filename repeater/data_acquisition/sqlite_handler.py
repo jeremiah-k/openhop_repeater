@@ -13,6 +13,10 @@ logger = logging.getLogger("SQLiteHandler")
 
 
 class SQLiteHandler:
+    # The busy handler armed on every new connection and restored on a cached
+    # connection after a bounded (`busy_timeout_ms`) call ran on it.
+    _DEFAULT_BUSY_TIMEOUT_MS = 5000
+
     def __init__(self, storage_dir: Path):
         self.storage_dir = storage_dir
         self.sqlite_path = self.storage_dir / "repeater.db"
@@ -45,7 +49,7 @@ class SQLiteHandler:
         self._init_database()
         self._run_migrations()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, busy_timeout_ms: Optional[int] = None) -> sqlite3.Connection:
         """Return a persistent thread-local SQLite connection.
 
         The first call from a given thread opens the connection and configures
@@ -70,14 +74,33 @@ class SQLiteHandler:
           'database is locked'.  5 s of automatic retry eliminates transient
           contention errors when the write executor and the HTTP thread
           briefly compete for the WAL write lock.
+
+        ``busy_timeout_ms`` bounds the busy handler for the call that asks for
+        it.  The bound is applied to the thread's cached connection and the
+        5 s default is restored on that connection's next unbounded call, so a
+        short bound can never leak into later operations.  The companion
+        queue's frame-server paths pass a short bound so a locked store
+        degrades within a moment instead of stalling a sync or a persist for
+        the default 5 s; calls on one thread are serial, so the bound cannot
+        leak into a concurrent caller.
         """
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(str(self.sqlite_path))
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA busy_timeout={self._DEFAULT_BUSY_TIMEOUT_MS}")
             self._local.conn = conn
+            self._local.busy_timeout_ms = self._DEFAULT_BUSY_TIMEOUT_MS
+        timeout = None if busy_timeout_ms is None else int(busy_timeout_ms)
+        if timeout is not None and timeout != self._local.busy_timeout_ms:
+            conn.execute(f"PRAGMA busy_timeout={timeout}")
+            self._local.busy_timeout_ms = timeout
+        elif timeout is None and self._local.busy_timeout_ms != self._DEFAULT_BUSY_TIMEOUT_MS:
+            # A previous call left a short override on this cached connection;
+            # restore the default so it cannot leak into unbounded operations.
+            conn.execute(f"PRAGMA busy_timeout={self._DEFAULT_BUSY_TIMEOUT_MS}")
+            self._local.busy_timeout_ms = self._DEFAULT_BUSY_TIMEOUT_MS
         return conn
 
     def _invalidate_hot_caches(self) -> None:
@@ -4202,6 +4225,7 @@ class SQLiteHandler:
         msg: Dict,
         max_messages: Optional[int] = None,
         arrival_seq: Optional[int] = None,
+        busy_timeout_ms: Optional[int] = None,
     ) -> bool:
         """Append a message to the companion's queue.
 
@@ -4233,7 +4257,7 @@ class SQLiteHandler:
             sender_prefix = msg.get("sender_prefix", b"")
             if not isinstance(sender_prefix, str):
                 sender_prefix = bytes(sender_prefix or b"").hex()
-            with self._connect() as conn:
+            with self._connect(busy_timeout_ms) as conn:
                 conn.execute("SAVEPOINT companion_message_push")
                 cursor = conn.execute(
                     """
@@ -4354,7 +4378,9 @@ class SQLiteHandler:
             logger.error(f"Failed to pop companion message: {e}")
             return None
 
-    def companion_max_arrival_seq(self, companion_hash: str) -> Optional[int]:
+    def companion_max_arrival_seq(
+        self, companion_hash: str, busy_timeout_ms: Optional[int] = None
+    ) -> Optional[int]:
         """Return the highest arrival number outstanding for a companion.
 
         Rows written before the arrival_seq migration have no number; their id
@@ -4367,7 +4393,7 @@ class SQLiteHandler:
         silently reordering against an unknown backlog.
         """
         try:
-            with self._connect() as conn:
+            with self._connect(busy_timeout_ms) as conn:
                 row = conn.execute(
                     """
                     SELECT MAX(COALESCE(arrival_seq, id)) FROM companion_messages
@@ -4384,7 +4410,9 @@ class SQLiteHandler:
             )
             return None
 
-    def companion_peek_message(self, companion_hash: str) -> Optional[tuple[int, Dict]]:
+    def companion_peek_message(
+        self, companion_hash: str, busy_timeout_ms: Optional[int] = None
+    ) -> Optional[tuple[int, Dict]]:
         """Return the oldest queued message *without* removing it.
 
         Returns ``(row_id, message)`` so the caller can delete exactly that
@@ -4402,7 +4430,7 @@ class SQLiteHandler:
         treat a locked or broken store as "no messages".
         """
         try:
-            with self._connect() as conn:
+            with self._connect(busy_timeout_ms) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
                     """
@@ -4426,14 +4454,19 @@ class SQLiteHandler:
             logger.error(f"Failed to peek companion message for {companion_hash}", exc_info=True)
             raise
 
-    def companion_delete_message(self, companion_hash: str, message_id: int) -> bool:
+    def companion_delete_message(
+        self,
+        companion_hash: str,
+        message_id: int,
+        busy_timeout_ms: Optional[int] = None,
+    ) -> bool:
         """Delete one queued message by row id.
 
         Returns True when a row was removed, False when the row was already
         gone (or the delete failed).
         """
         try:
-            with self._connect() as conn:
+            with self._connect(busy_timeout_ms) as conn:
                 cursor = conn.execute(
                     "DELETE FROM companion_messages WHERE id = ? AND companion_hash = ?",
                     (message_id, companion_hash),

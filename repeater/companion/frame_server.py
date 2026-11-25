@@ -28,6 +28,19 @@ class CompanionFrameServer(_BaseFrameServer):
     zero changes.
     """
 
+    # The companion queue's store round-trips carry this short busy bound so a
+    # locked store degrades within a moment instead of stalling syncs and
+    # persists for the connection's default busy timeout (5 s each).
+    _STORE_BUSY_TIMEOUT_MS = 250
+    # A persist that fails because the store is locked is retried at this pace
+    # until this deadline expires; the message stays in memory (still syncable)
+    # the whole time and is never dropped.
+    _PERSIST_RETRY_INTERVAL_S = 1.0
+    _PERSIST_RETRY_DEADLINE_S = 60.0
+    # Class-level default so ``__new__``-built test doubles behave like a
+    # server whose store is currently readable.
+    _store_unreadable_episode = False
+
     def __init__(
         self,
         bridge,
@@ -105,8 +118,8 @@ class CompanionFrameServer(_BaseFrameServer):
         to every admitted message (``MessageQueue.push``), and the sync serves
         the lowest outstanding number across memory and the store. Rows
         persisted by an earlier run already carry such numbers, so the counter
-        is raised once at start above the highest stored number -- never with
-        a per-message store read. When the store cannot be read the counter
+        is raised once at start above the highest stored number — never with a
+        per-message store read. When the store cannot be read the counter
         stays where it is: new messages may then interleave with the stored
         backlog, the delivery-order claim across the stores is dropped, and a
         warning is logged. Rows written before the arrival_seq migration have
@@ -115,7 +128,9 @@ class CompanionFrameServer(_BaseFrameServer):
         arrival order).
         """
         seed = await asyncio.to_thread(
-            self.sqlite_handler.companion_max_arrival_seq, self.companion_hash
+            self.sqlite_handler.companion_max_arrival_seq,
+            self.companion_hash,
+            self._STORE_BUSY_TIMEOUT_MS,
         )
         if seed is None:
             logger.warning(
@@ -124,23 +139,36 @@ class CompanionFrameServer(_BaseFrameServer):
                 self.companion_hash,
             )
             return
-        self.bridge.message_queue.seed_arrival_counter(seed)
+        seed_fn = getattr(self.bridge.message_queue, "seed_arrival_counter", None)
+        if seed_fn is None:
+            # An offline queue that does not assign admission numbers (an
+            # older core): rows are written without a number and fall back to
+            # their row order at read time.
+            logger.warning(
+                "Companion %s: the offline queue does not assign admission "
+                "numbers; delivery order across the persisted rows is not "
+                "guaranteed",
+                self.companion_hash,
+            )
+            return
+        seed_fn(seed)
 
     # -----------------------------------------------------------------
     # Persistence hook overrides
     # -----------------------------------------------------------------
 
-    async def _message_operation(self, operation, *args) -> None:
+    async def _message_operation(self, operation, *args):
         """Serialize queue ownership transfers, including SQLite completion.
 
         Cancellation while waiting for the lock leaves memory untouched. Once
         started, finish the transfer before releasing the lock: cancelling an
         asyncio.to_thread await cannot cancel the underlying SQLite operation.
+        Returns the operation's result.
         """
         async with self._message_lock:
             task = asyncio.create_task(operation(*args))
             try:
-                await asyncio.shield(task)
+                return await asyncio.shield(task)
             except asyncio.CancelledError:
                 while not task.done():
                     try:
@@ -150,16 +178,27 @@ class CompanionFrameServer(_BaseFrameServer):
                 task.result()
                 raise
 
-    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> bool:
         if self.sqlite_handler:
-            await self._message_operation(self._persist_message_locked, msg_dict, queue_entry)
+            persisted = await self._message_operation(
+                self._persist_message_locked, msg_dict, queue_entry
+            )
+            if not persisted:
+                self._schedule_persist_retry(msg_dict, queue_entry)
+            return persisted
+        return False
 
-    async def _persist_message_locked(self, msg_dict: dict, queue_entry) -> None:
-        """Transfer memory ownership to SQLite before another sync can read it."""
+    async def _persist_message_locked(self, msg_dict: dict, queue_entry) -> bool:
+        """Transfer memory ownership to SQLite before another sync can read it.
+
+        Returns whether the message is now durably stored (or needed no store).
+        A message the store rejected stays in memory; the caller schedules a
+        bounded retry so the row lands once the store is writable again.
+        """
         # Another callback may have suspended before this persistence callback
         # ran. In that case a successful frame handoff already owns the entry.
         if getattr(queue_entry, "frame_enqueued", False):
-            return
+            return True
         retention = getattr(
             self.bridge.message_queue,
             "max_size",
@@ -167,17 +206,57 @@ class CompanionFrameServer(_BaseFrameServer):
         )
         if retention == 0:
             self._remove_queue_entry(queue_entry)
-            return
+            return True
         _, persisted = await asyncio.to_thread(
             self._stamp_and_push, queue_entry, msg_dict, retention
         )
         if persisted:
             self._remove_queue_entry(queue_entry)
-        else:
-            logger.debug(
-                "Companion %s: retaining message in memory after SQLite queue rejection",
-                self.companion_hash,
-            )
+            return True
+        logger.debug(
+            "Companion %s: retaining message in memory after SQLite queue rejection",
+            self.companion_hash,
+        )
+        return False
+
+    def _schedule_persist_retry(self, msg_dict: dict, queue_entry) -> None:
+        """Retry a failed persist at a bounded pace until the row lands.
+
+        The message stays in memory the whole time — a sync may still serve it,
+        and each retry attempt skips itself if the entry was frame-enqueued in
+        the meantime. When the lock lifts the row is written exactly once,
+        because the successful attempt removes the entry from memory under the
+        same message lock that serializes syncs.
+        """
+        tasks: set[asyncio.Task] = getattr(self, "_persist_retry_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._persist_retry_tasks = tasks
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._PERSIST_RETRY_DEADLINE_S
+
+        async def _retry() -> None:
+            while loop.time() < deadline:
+                await asyncio.sleep(self._PERSIST_RETRY_INTERVAL_S)
+                if getattr(queue_entry, "frame_enqueued", False):
+                    return
+                try:
+                    if await self._message_operation(
+                        self._persist_message_locked, msg_dict, queue_entry
+                    ):
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug(
+                        "Companion %s: persist retry attempt failed",
+                        self.companion_hash,
+                        exc_info=True,
+                    )
+
+        task = asyncio.create_task(_retry(), name=f"companion-persist-retry-{id(queue_entry)}")
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     def _stamp_and_push(self, queue_entry, msg_dict: dict, retention) -> tuple[Optional[int], bool]:
         """Persist an entry under its admission number (holds ``_message_lock``).
@@ -204,7 +283,11 @@ class CompanionFrameServer(_BaseFrameServer):
                 seq = None
         persisted = bool(
             self.sqlite_handler.companion_push_message(
-                self.companion_hash, msg_dict, retention, seq
+                self.companion_hash,
+                msg_dict,
+                retention,
+                seq,
+                busy_timeout_ms=self._STORE_BUSY_TIMEOUT_MS,
             )
         )
         return seq, persisted
@@ -248,7 +331,9 @@ class CompanionFrameServer(_BaseFrameServer):
         """
         if not self.sqlite_handler:
             return None
-        peeked = self.sqlite_handler.companion_peek_message(self.companion_hash)
+        peeked = self.sqlite_handler.companion_peek_message(
+            self.companion_hash, busy_timeout_ms=self._STORE_BUSY_TIMEOUT_MS
+        )
         if not peeked:
             return None
         row_id, msg_dict = peeked
@@ -307,17 +392,26 @@ class CompanionFrameServer(_BaseFrameServer):
         # Peek both stores before popping anything so the client is served
         # from whichever store holds the lowest outstanding arrival number,
         # rather than "memory first".  A locked or broken store raises here
-        # and the sync degrades to memory-first below.
+        # (the peek carries a short busy bound, so a real exclusive lock
+        # surfaces within a moment instead of the default busy timeout) and
+        # the sync degrades to memory-first below, warning once per lock
+        # episode rather than once per sync.
+        peek_ok = True
         try:
             peeked = await asyncio.to_thread(self._sync_next_from_persistence)
         except Exception:
+            peek_ok = False
             peeked = None
-            logger.warning(
-                "Companion %s: persisted queue unreadable; serving in-memory messages first "
-                "and delivery order across the stores is not guaranteed",
-                self.companion_hash,
-                exc_info=True,
-            )
+            if not self._store_unreadable_episode:
+                self._store_unreadable_episode = True
+                logger.warning(
+                    "Companion %s: persisted queue unreadable; serving in-memory messages first "
+                    "and delivery order across the stores is not guaranteed",
+                    self.companion_hash,
+                    exc_info=True,
+                )
+        if peek_ok:
+            self._store_unreadable_episode = False
         if self._write_queue is not queue:
             return
         memory_first = True
@@ -330,8 +424,8 @@ class CompanionFrameServer(_BaseFrameServer):
             # the same number, and rows written before the arrival_seq
             # migration report their row id, which is their arrival order), so
             # this compares true arrival order no matter when each persist
-            # completed. An entry without an admission number -- an event that
-            # bypassed the queue, or a model that forbids attributes -- carries
+            # completed. An entry without an admission number — an event that
+            # bypassed the queue, or a model that forbids attributes — carries
             # no order claim at all: it is served from memory first rather
             # than being treated as the newest message and held behind rows it
             # cannot be ordered against.
@@ -358,7 +452,10 @@ class CompanionFrameServer(_BaseFrameServer):
             )
             return
         deleted = await asyncio.to_thread(
-            self.sqlite_handler.companion_delete_message, self.companion_hash, row_id
+            self.sqlite_handler.companion_delete_message,
+            self.companion_hash,
+            row_id,
+            self._STORE_BUSY_TIMEOUT_MS,
         )
         if not deleted:
             # Do not stream the same retained row repeatedly on this client.
@@ -507,4 +604,8 @@ class CompanionFrameServer(_BaseFrameServer):
                 await self._save_channels()
             except Exception as e:
                 logger.warning("Failed to persist contacts/channels on stop: %s", e)
+        tasks: set[asyncio.Task] = getattr(self, "_persist_retry_tasks", None) or set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await super().stop()

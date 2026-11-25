@@ -22,6 +22,7 @@ STATE_FILENAME = "state.json"
 DEFAULT_PLUGINS_SUBDIR = "plugins"
 DEFAULT_SOCKET_NAME = "plugin-manager.sock"
 LOG_TAIL_MAX_BYTES = 256 * 1024
+RUNTIME_MAX_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -320,18 +321,60 @@ class PluginStorage:
         self._atomic_write_json(path, config)
         return path
 
+    def _open_runtime_file(self, path: Path) -> int:
+        """Open a file below the storage root without following any symlink.
+
+        The plugin owns every component below the manager-owned root, so
+        each directory on the way is opened with ``O_DIRECTORY|O_NOFOLLOW``
+        and the final component with ``O_NOFOLLOW|O_NONBLOCK``: a plugin
+        that replaces its data directory, or any intermediate component,
+        with a symlink fails the open instead of redirecting the read.
+        """
+        relative = path.relative_to(self.root)
+        dir_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in relative.parts[:-1]:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                os.close(dir_fd)
+                dir_fd = next_fd
+            return os.open(
+                relative.parts[-1],
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=dir_fd,
+            )
+        finally:
+            os.close(dir_fd)
+
     def read_runtime(self, plugin_id: str) -> dict[str, Any]:
         """Read plugin-owned data/runtime.json. Missing file -> {}."""
         path = self.runtime_path(plugin_id)
-        if not path.is_file():
-            return {}
+        # Open once, without following any symlink on the path or blocking on
+        # a FIFO. The plugin owns the file, but the management API owns its
+        # read budget.
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"invalid plugin runtime.json: {exc}") from exc
-        if data is None:
+            fd = self._open_runtime_file(path)
+        except FileNotFoundError:
             return {}
+        except OSError as exc:
+            raise ValueError("invalid plugin runtime.json") from exc
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("plugin runtime.json must be a regular file")
+                content = stream.read(RUNTIME_MAX_BYTES + 1)
+        except OSError as exc:
+            raise ValueError("invalid plugin runtime.json") from exc
+        if len(content) > RUNTIME_MAX_BYTES:
+            raise ValueError("plugin runtime.json exceeds the byte limit")
+        try:
+            data = json.loads(content)
+        except (UnicodeError, ValueError, RecursionError) as exc:
+            # ValueError covers json.JSONDecodeError and the plain ValueError
+            # an integer above Python's digit limit raises.
+            raise ValueError("invalid plugin runtime.json") from exc
         if not isinstance(data, dict):
+            # The documented observation is a JSON object; a missing file is
+            # the only empty observation, a parsed null is invalid.
             raise ValueError("plugin runtime.json must be a JSON object")
         return data
 

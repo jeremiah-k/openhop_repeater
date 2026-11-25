@@ -452,3 +452,7 @@ qualifying whole-host shutdown, explicitly stop each managed plugin that
 persists state while the repeater is alive, and confirm a clean exit. Do not treat an IPC timeout as cancellation;
 inspect status before retrying. No plugin can select its own unbounded timeout
 through its manifest.
+
+Plugin runtime observations must be JSON objects in regular, non-symlink files
+no larger than 64 KiB. The management API owns this read budget; it does not
+read FIFOs or arbitrary target files. Missing runtime observations are allowed.

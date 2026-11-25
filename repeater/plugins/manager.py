@@ -24,6 +24,11 @@ from .github_releases import (
 )
 from .manifest import ManifestError, load_manifest_from_wheel
 from .runtime import PluginRuntime, PluginState
+from .shutdown_policy import (
+    ShutdownPolicy,
+    drain_grace_seconds,
+    effective_stop_budget,
+)
 from .storage import PluginStorage
 
 logger = logging.getLogger("PluginManager")
@@ -131,9 +136,13 @@ class PluginManager:
         catalogue_client: Optional[CatalogueClient] = None,
         github_client: Optional[GitHubReleaseClient] = None,
         catalogue_url: Optional[str] = None,
+        shutdown_policy: Optional[ShutdownPolicy] = None,
+        granted_stop_seconds: Optional[int] = None,
     ):
         self.storage = storage
         self.runtime = runtime or PluginRuntime(storage)
+        self.shutdown_policy = shutdown_policy
+        self.granted_stop_seconds = granted_stop_seconds
         self._lock = threading.RLock()
         self._operations: dict[str, tuple[int, int]] = {}
         self._progress: dict[str, OperationProgress] = {}
@@ -238,12 +247,54 @@ class PluginManager:
                 self.runtime._runtime_state[plugin_id] = PluginState.FAILED
 
     def stop_all(self) -> None:
-        for plugin_id in list(self.storage.list_plugin_ids()):
+        if self.shutdown_policy is None:
+            # Unmanaged installations keep the upstream order: stop the
+            # plugins first, then retire crash supervision.
+            for plugin_id in list(self.storage.list_plugin_ids()):
+                try:
+                    self.runtime.stop(plugin_id)
+                except Exception as exc:
+                    logger.debug("stop_all %s: %s", plugin_id, exc)
+            self.runtime.stop_supervisor()
+            return
+        # Managed drain: retire crash supervision before the first managed
+        # stop. A plugin that crashes while another plugin is being stopped
+        # must not be restarted during the drain: the restart runs outside the
+        # shutdown budget and can rebuild a plugin virtualenv.
+        self.runtime.stop_supervisor()
+        plugin_ids = list(self.storage.list_plugin_ids())
+        grace = self._drain_grace_seconds()
+        for plugin_id in plugin_ids:
             try:
-                self.runtime.stop(plugin_id)
+                self.runtime.stop(plugin_id, timeout=grace)
             except Exception as exc:
                 logger.debug("stop_all %s: %s", plugin_id, exc)
-        self.runtime.stop_supervisor()
+
+    def _drain_grace_seconds(self) -> Optional[float]:
+        """Per-plugin SIGTERM grace that keeps the sequential drain bounded.
+
+        The manager stops plugins one after another, so a per-plugin grace
+        sized for a single plugin would let the whole drain overrun the
+        container shutdown timeout and get the manager killed mid-drain.
+        """
+        policy = self.shutdown_policy
+        if policy is None:
+            return None
+        draining = self.runtime.running_plugin_ids()
+        if not draining:
+            return None
+        budget = effective_stop_budget(policy, self.granted_stop_seconds)
+        grace = drain_grace_seconds(policy, len(draining), budget)
+        if grace < policy.stop_timeout_seconds:
+            logger.warning(
+                "Draining %d managed process(es) within %ds; per-plugin stop "
+                "grace reduced from %ds to %ds",
+                len(draining),
+                budget,
+                policy.stop_timeout_seconds,
+                grace,
+            )
+        return grace
 
     def list_plugins(self) -> list[dict[str, Any]]:
         result = []

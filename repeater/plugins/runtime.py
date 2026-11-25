@@ -654,7 +654,18 @@ class PluginRuntime:
         except (OSError, ValueError):
             logger.debug("Plugin log stream closed for %s", handle.plugin_id)
 
-    def stop(self, plugin_id: str, *, mark_disabled: bool = False) -> PluginState:
+    def running_plugin_ids(self) -> list[str]:
+        """Plugin ids with a live process handle."""
+        with self._lock:
+            return list(self._handles)
+
+    def stop(
+        self,
+        plugin_id: str,
+        *,
+        mark_disabled: bool = False,
+        timeout: Optional[float] = None,
+    ) -> PluginState:
         with self._lock:
             handle = self._handles.get(plugin_id)
             self._runtime_state[plugin_id] = (
@@ -667,7 +678,7 @@ class PluginRuntime:
                 return self._runtime_state[plugin_id]
 
         # Keep the group identity captured at spawn even if the leader exited.
-        self._terminate_handle(handle)
+        self._terminate_handle(handle, timeout=timeout)
 
         with self._lock:
             self._cleanup_handle(plugin_id)
@@ -694,9 +705,10 @@ class PluginRuntime:
             else:
                 handle.process.send_signal(sig)
 
-    def _terminate_handle(self, handle: ProcessHandle) -> None:
+    def _terminate_handle(self, handle: ProcessHandle, *, timeout: Optional[float] = None) -> None:
         self._signal_handle(handle, signal.SIGTERM)
-        deadline = time.monotonic() + self.stop_timeout
+        grace = self.stop_timeout if timeout is None else max(0.0, float(timeout))
+        deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
             handle.process.poll()  # reap the leader, but do not equate it to the group
             if handle.process_group is None:

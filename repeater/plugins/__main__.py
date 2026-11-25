@@ -18,6 +18,15 @@ from typing import Any, Optional
 from .ipc import PluginIPCServer
 from .manager import PluginManager
 from .runtime import PluginRuntime
+from .shutdown_policy import (
+    advertised_stop_timeout_seconds,
+    check_container_budget,
+    check_outer_deadline,
+    granted_manager_stop_timeout_seconds,
+    managed_shutdown_configured,
+    required_container_timeout,
+    shutdown_policy,
+)
 from .storage import (
     PluginStorage,
     resolve_catalogue_url,
@@ -90,10 +99,37 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         socket_path = resolve_plugin_socket_path(config)
 
+    try:
+        policy = shutdown_policy(config)
+    except ValueError as exc:
+        logger.error("Invalid plugin shutdown policy: %s", exc)
+        return 2
     storage = PluginStorage(plugins_root)
-    runtime = PluginRuntime(storage)
-    manager = PluginManager(storage, runtime, catalogue_url=resolve_catalogue_url(config))
+    runtime = PluginRuntime(storage, stop_timeout=policy.stop_timeout_seconds)
+    # The deployment owns the outer deadline; the manager may not spend more
+    # on the drain than the deadline it is actually granted.
+    granted = granted_manager_stop_timeout_seconds()
+    if granted is None:
+        granted = advertised_stop_timeout_seconds()
+    manager = PluginManager(
+        storage,
+        runtime,
+        catalogue_url=resolve_catalogue_url(config),
+        shutdown_policy=policy if managed_shutdown_configured(config) else None,
+        granted_stop_seconds=granted,
+    )
     server = PluginIPCServer(socket_path, manager)
+    if managed_shutdown_configured(config):
+        # The manager drains the enabled service plugins sequentially and then
+        # exits; the deployment must allow for that drain.
+        enabled_count = len(storage.list_enabled_service_plugin_ids())
+        check_outer_deadline(
+            required_container_timeout(enabled_count, policy.stop_timeout_seconds),
+            scope="plugin manager drain",
+        )
+        # The enabled count changes before shutdown, so an underfunded
+        # container wait is reported rather than refused.
+        check_container_budget(policy, enabled_count)
 
     stop = {"flag": False}
 

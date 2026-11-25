@@ -40,6 +40,7 @@ def _handler(tmp_path) -> SQLiteHandler:
 def _frame_server(handler: SQLiteHandler) -> CompanionFrameServer:
     """A frame server wired to ``handler`` with no client attached."""
     fs = CompanionFrameServer.__new__(CompanionFrameServer)
+    fs._message_lock = asyncio.Lock()
     fs._app_target_ver = 3
     fs.sqlite_handler = handler
     fs.companion_hash = _HASH
@@ -153,7 +154,8 @@ async def test_enqueue_failure_leaves_row_and_retry_delivers_once(tmp_path):
     await fs._cmd_sync_next_message(b"")
     assert handler.companion_count_messages(_HASH) == 1
 
-    # A client connects and asks again: the message is delivered exactly once.
+    # A client connects and asks again: the message is queued for that client
+    # once and its persisted row is retired.
     queue = _attach_client(fs)
     await fs._cmd_sync_next_message(b"")
     payloads = _queued_payloads(queue)

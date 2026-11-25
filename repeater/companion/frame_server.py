@@ -56,6 +56,7 @@ class CompanionFrameServer(_BaseFrameServer):
             control_handler=control_handler,
         )
         self.sqlite_handler = sqlite_handler
+        self._message_lock = asyncio.Lock()
         self.batt_getter = batt_getter
         self.storage_dir = storage_dir
 
@@ -100,23 +101,36 @@ class CompanionFrameServer(_BaseFrameServer):
     # Persistence hook overrides
     # -----------------------------------------------------------------
 
-    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
-        """Persist message to SQLite and remove it from the bridge queue.
+    async def _message_operation(self, operation, *args) -> None:
+        """Serialize queue ownership transfers, including SQLite completion.
 
-        The bridge's ``offline_queue_size`` (``message_queue.max_size``) doubles
-        as the SQLite retention limit: 0 disables offline storage entirely, so the
-        message is dropped instead of persisted.
-
-        ``queue_entry`` is the exact in-memory entry this message came from.  The
-        persisted entry is removed by identity (``message_queue.remove``) rather
-        than by ``pop_last``: pushes happen synchronously in sibling receive
-        tasks, so during the awaited ``to_thread`` another task can append a newer
-        entry and ``pop_last`` would remove that one instead — duplicating this
-        message and losing the newer one.
+        Cancellation while waiting for the lock leaves memory untouched. Once
+        started, finish the transfer before releasing the lock: cancelling an
+        asyncio.to_thread await cannot cancel the underlying SQLite operation.
         """
-        if not self.sqlite_handler:
+        async with self._message_lock:
+            task = asyncio.create_task(operation(*args))
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                task.result()
+                raise
+
+    async def _persist_companion_message(self, msg_dict: dict, queue_entry=None) -> None:
+        if self.sqlite_handler:
+            await self._message_operation(self._persist_message_locked, msg_dict, queue_entry)
+
+    async def _persist_message_locked(self, msg_dict: dict, queue_entry) -> None:
+        """Transfer memory ownership to SQLite before another sync can read it."""
+        # Another callback may have suspended before this persistence callback
+        # ran. In that case a successful frame handoff already owns the entry.
+        if getattr(queue_entry, "frame_enqueued", False):
             return
-        # Older cores predate the public max_size property.
         retention = getattr(
             self.bridge.message_queue,
             "max_size",
@@ -139,21 +153,25 @@ class CompanionFrameServer(_BaseFrameServer):
                 self.companion_hash,
             )
 
-    def _remove_queue_entry(self, queue_entry) -> None:
+    def _remove_queue_entry(self, queue_entry) -> bool:
         """Remove exactly the persisted entry from the bridge queue by identity.
 
         Falling back to ``pop_last`` when ``queue_entry`` is None would reopen the
         interleaving race (it could evict a newer, unpersisted entry), so an event
         from an older core that carries no entry is left in memory: a possible
         duplicate is preferable to losing a message.
+
+        Returns True when the entry was found and removed, False when it was
+        not in the queue any more - it was delivered to a client, evicted, or
+        never queued.
         """
         if queue_entry is None:
             logger.debug(
                 "Companion %s: no queue entry on persisted message; leaving in memory",
                 self.companion_hash,
             )
-            return
-        self.bridge.message_queue.remove(queue_entry)
+            return False
+        return bool(self.bridge.message_queue.remove(queue_entry))
 
     def _sync_next_from_persistence(self) -> Optional[tuple[int, QueuedMessage]]:
         """Peek the next persisted message when the bridge queue is empty.
@@ -192,42 +210,38 @@ class CompanionFrameServer(_BaseFrameServer):
     # -----------------------------------------------------------------
 
     async def _cmd_sync_next_message(self, data: bytes) -> None:
-        """Sync next message; run persistence I/O in a thread so SQLite does not block.
+        """Transfer a single queued entry to this client's outbound queue.
 
-        The persisted row is deleted only after the frame has actually been
-        queued for the client.  When the enqueue fails (no client attached, a
-        payload that does not fit, or a full write queue) the row stays in
-        SQLite and the message is delivered by a later sync attempt instead of
-        being lost.
-
-        Remaining boundary: the companion protocol has no end-to-end
-        acknowledgement.  Once the frame is queued the delivery is
-        *at-most-once* — a client that disconnects before reading the frame
-        loses that copy, and the message is not replayed.
+        A successful enqueue is not a client receipt. A disconnect or process
+        crash after enqueue can still lose a message; a failed SQLite delete
+        can still cause a replay. The protocol has no acknowledgement to close
+        that boundary.
         """
-        msg = self.bridge.sync_next_message()
-        row_id = None
-        if msg is None:
-            peeked = await asyncio.to_thread(self._sync_next_from_persistence)
-            if peeked is None:
-                self._write_frame(bytes([RESP_CODE_NO_MORE_MESSAGES]))
-                return
-            row_id, msg = peeked
-        frame = self._build_message_frame(msg)
-        if not self._write_frame(frame):
-            # The frame did not reach the client: keep the row for a retry.
-            logger.warning(
-                "Companion %s: message frame could not be queued; keeping it queued",
-                self.companion_hash,
-            )
+        await self._message_operation(self._sync_message_locked, self._write_queue)
+
+    async def _sync_message_locked(self, queue) -> None:
+        if self._write_queue is not queue:
+            return
+        if self._sync_memory_message():
+            return
+        peeked = await asyncio.to_thread(self._sync_next_from_persistence)
+        if self._write_queue is not queue:
+            return
+        if peeked is None:
             self._write_frame(bytes([RESP_CODE_NO_MORE_MESSAGES]))
             return
-        if row_id is not None:
-            await asyncio.to_thread(
-                self.sqlite_handler.companion_delete_message,
-                self.companion_hash,
-                row_id,
-            )
+        row_id, msg = peeked
+        if not self._write_frame(self._build_message_frame(msg)):
+            return
+        deleted = await asyncio.to_thread(
+            self.sqlite_handler.companion_delete_message, self.companion_hash, row_id
+        )
+        if not deleted:
+            # Do not stream the same retained row repeatedly on this client.
+            # A subsequent reconnect can retry; no protocol-level receipt exists.
+            logger.warning("Companion %s: queued message retirement failed", self.companion_hash)
+            if self._write_queue is queue and self._client_writer is not None:
+                self._client_writer.close()
 
     @staticmethod
     def _contact_to_dict(c) -> dict:

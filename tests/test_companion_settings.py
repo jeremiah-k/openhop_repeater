@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -527,6 +528,7 @@ class TestPersistSkipWhenOff:
         from repeater.companion.frame_server import CompanionFrameServer
 
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
+        fs._message_lock = asyncio.Lock()
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
         bridge = MagicMock()

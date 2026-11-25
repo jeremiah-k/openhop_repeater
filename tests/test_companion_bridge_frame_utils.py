@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
@@ -148,7 +149,9 @@ async def test_frame_server_persistence_paths_and_stop():
         srv = CompanionFrameServer(bridge=bridge, companion_hash="h", sqlite_handler=sqlite)
         srv.bridge = bridge
         srv.companion_hash = "h"
-        srv._write_frame = MagicMock()
+        srv._message_lock = asyncio.Lock()
+        srv._write_queue = asyncio.Queue()
+        srv._write_frame = MagicMock(return_value=True)
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
         entry = object()
@@ -205,7 +208,9 @@ async def test_frame_server_no_more_messages_response_when_empty():
     ):
         srv = CompanionFrameServer(bridge=bridge, companion_hash="h", sqlite_handler=None)
         srv.bridge = bridge
-        srv._write_frame = MagicMock()
+        srv._message_lock = asyncio.Lock()
+        srv._write_queue = asyncio.Queue()
+        srv._write_frame = MagicMock(return_value=True)
         await srv._cmd_sync_next_message(b"")
         # RESP_CODE_NO_MORE_MESSAGES is encoded as a single-byte frame.
         assert srv._write_frame.call_args[0][0] == bytes([RESP_CODE_NO_MORE_MESSAGES])
@@ -250,7 +255,9 @@ async def test_restart_queue_rows_are_delivered_once_from_sqlite():
         srv = CompanionFrameServer(bridge=bridge, companion_hash="h", sqlite_handler=sqlite)
         srv.bridge = bridge
         srv.companion_hash = "h"
-        srv._write_frame = MagicMock()
+        srv._message_lock = asyncio.Lock()
+        srv._write_queue = asyncio.Queue()
+        srv._write_frame = MagicMock(return_value=True)
         srv._build_message_frame = lambda message: message.text.encode()
 
         await srv._cmd_sync_next_message(b"")

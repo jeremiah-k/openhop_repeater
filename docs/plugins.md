@@ -108,6 +108,11 @@ sudo systemctl enable --now openhop-plugin-manager
 
 The manager starts enabled service plugins on boot and supervises crashes
 (restarts with a simple crash-loop limit: 5 unexpected exits in 60s → `FAILED`).
+With the managed shutdown policy enabled, crash supervision is retired before
+the first plugin is stopped, so a plugin that crashes while another plugin is
+being stopped is not started again during the drain. Without that policy the
+manager keeps the upstream order: it stops the plugins first and retires crash
+supervision afterwards.
 
 Repeater does **not** require the manager. If the socket is missing, plugin API
 calls return HTTP 503 and normal Repeater operation continues.
@@ -375,3 +380,66 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 R2 catalogue or GitHub Release download outages do not affect already-installed
 plugins or Repeater startup. Local `.whl` install continues to work unchanged.
 
+
+## Optional longer service shutdown
+
+Plugins that drain durable work before exiting may need more than the default
+five-second stop budget. The following is an opt-in candidate deployment policy:
+
+```yaml
+plugins:
+  enabled: true
+  stop_timeout_seconds: 20
+  container_shutdown_timeout_seconds: 40
+  stop_before_repeater: true
+```
+
+The first setting is the per-plugin SIGTERM grace (integer 5–20s). The limit
+preserves margin within the existing 30-second ordinary lifecycle IPC budget;
+process reap and log-thread join also take time. The second setting is the
+container supervisor's per-service wait (integer 8–300s). The last setting
+stops the manager before signalling the repeater, keeping radio services
+available during normal plugin drain. With all settings omitted existing
+five-second plugin grace, eight-second container wait and parallel signalling
+remain. Manager shutdown retires crash supervision before stopping installed
+plugins only when the policy is enabled; otherwise it stops the plugins first
+and retires crash supervision afterwards.
+
+Size the container wait for every managed process that might be running,
+including manually started services. Each sequential stop needs its SIGTERM
+grace, up to two seconds for SIGKILL reaping and two for log-thread joining;
+the manager reserves another eight seconds. The planning allowance is
+`plugin_count × (stop_timeout_seconds + 4) + 8` (32s, 56s and 80s for
+one, two and three plugins at 20s). Configuration parsing checks a one-plugin
+minimum; a larger live process count is not rejected at enable time. When the
+configured container wait cannot fund the plugins enabled at startup, the
+manager logs a warning naming the required seconds and the plugin count. At
+shutdown the manager measures the actual process handles and shares the
+available grace among them. This is best-effort when the outer grant is
+insufficient even for fixed cleanup overhead.
+
+The outer deadline must cover the whole ordered stop: the container supervisor
+waits for the plugin manager and then for the repeater, each with the
+container wait, so the deployment needs at least
+`2 × container_shutdown_timeout_seconds + 10` seconds (90s for the example
+above). The deployment declares that deadline in
+`OPENHOP_STOP_TIMEOUT_SECONDS`; Compose sets it from the same variable that
+configures `stop_grace_period`, and the systemd manager unit ships
+`OPENHOP_MANAGER_STOP_TIMEOUT_SECONDS` alongside its `TimeoutStopSec`. The
+repeater warns when the declared deadline is shorter than the budget it
+needs, caps each container wait against the declared outer grant and reduces
+per-plugin grace accordingly. An undersized grant is not a cleanup guarantee. Raise the matching outer timeout as well:
+Compose `stop_grace_period`, the systemd `TimeoutStopSec` of the manager unit
+and the repeater unit, and the HA add-on's `OPENHOP_ADDON_STOP_TIMEOUT`. The
+HA Supervisor has an outer lifecycle budget of its own that must also be
+qualified. Installations that do not enable the managed shutdown policy keep
+their existing timeouts and defaults.
+
+These are time allowances, not proof of successful application drain. Manager
+shutdown visits installed plugins sequentially, and may include pending IPC
+workers; size the outer deadline for all enabled services. A forcibly killed
+manager cannot guarantee cleanup of independent plugin process groups. Before
+qualifying whole-host shutdown, explicitly stop each managed plugin that
+persists state while the repeater is alive, and confirm a clean exit. Do not treat an IPC timeout as cancellation;
+inspect status before retrying. No plugin can select its own unbounded timeout
+through its manifest.

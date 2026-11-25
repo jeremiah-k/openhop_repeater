@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .manifest import MANIFEST_FILENAME, PluginManifest, load_manifest_file
+from .manifest import MANIFEST_FILENAME, ManifestError, PluginManifest, load_manifest_file
 
 logger = logging.getLogger("PluginStorage")
 
@@ -152,6 +152,25 @@ class PluginStorage:
             if child.is_dir() and (child / STATE_FILENAME).is_file():
                 ids.append(child.name)
         return ids
+
+    def list_enabled_service_plugin_ids(self) -> list[str]:
+        """Enabled plugins that declare a runtime service.
+
+        These are the plugins the manager starts and later drains on shutdown,
+        so their number bounds the sequential stop time.
+        """
+        result = []
+        for plugin_id in self.list_plugin_ids():
+            state = self.read_state(plugin_id) or {}
+            if not state.get("enabled", False):
+                continue
+            try:
+                manifest = self.load_current_manifest(plugin_id)
+            except ManifestError:
+                continue
+            if manifest is not None and manifest.runtime is not None:
+                result.append(plugin_id)
+        return result
 
     def read_state(self, plugin_id: str) -> Optional[dict[str, Any]]:
         path = self.paths_for(plugin_id).state_file

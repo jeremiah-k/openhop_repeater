@@ -13,9 +13,19 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
+
+from .shutdown_policy import (
+    MANAGER_STOP_TIMEOUT_ENV,
+    advertised_stop_timeout_seconds,
+    effective_container_timeout,
+    check_outer_deadline,
+    managed_shutdown_configured,
+    required_outer_timeout,
+    shutdown_policy,
+)
 
 logger = logging.getLogger("ContainerSupervisor")
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -81,6 +91,7 @@ class ContainerSupervisor:
         sleep: Callable[[float], None] = time.sleep,
         manager_restart_delay: float = 2.0,
         shutdown_timeout: float = 8.0,
+        stop_plugins_first: bool = False,
     ):
         self.config_path = str(config_path)
         self.manager_enabled = (
@@ -93,12 +104,13 @@ class ContainerSupervisor:
         self._sleep = sleep
         self.manager_restart_delay = manager_restart_delay
         self.shutdown_timeout = shutdown_timeout
+        self.stop_plugins_first = stop_plugins_first
         self.manager_process: subprocess.Popen | None = None
         self.repeater_process: subprocess.Popen | None = None
         self._stopping = False
         self._shutdown_signal = signal.SIGTERM
 
-    def _start(self, module: str) -> subprocess.Popen:
+    def _start(self, module: str, env: Optional[dict[str, str]] = None) -> subprocess.Popen:
         command = [
             self.python_executable,
             "-m",
@@ -106,11 +118,16 @@ class ContainerSupervisor:
             "--config",
             self.config_path,
         ]
-        return self._popen(command, start_new_session=True)
+        return self._popen(command, start_new_session=True, env=env)
 
     def _start_manager(self) -> None:
         logger.info("Starting plugin manager")
-        self.manager_process = self._start("repeater.plugins")
+        # The supervisor waits for the manager with the container shutdown
+        # timeout, so that is the deadline the manager actually has. Declare
+        # it so the manager bounds its drain accordingly.
+        env = dict(os.environ)
+        env[MANAGER_STOP_TIMEOUT_ENV] = str(int(self.shutdown_timeout))
+        self.manager_process = self._start("repeater.plugins", env=env)
 
     def request_shutdown(self, signum: int = signal.SIGTERM) -> None:
         if self._stopping:
@@ -118,6 +135,10 @@ class ContainerSupervisor:
         self._stopping = True
         self._shutdown_signal = signum
         logger.info("Signal %s received; stopping container services", signum)
+        # Ordered mode performs the waits in normal run-loop context. In
+        # particular, do not stop the radio while a bridge is still draining.
+        if self.stop_plugins_first:
+            return
         for process in (self.repeater_process, self.manager_process):
             if process is not None:
                 self._signal_process_group(process, signum)
@@ -139,8 +160,14 @@ class ContainerSupervisor:
     def _finish(self) -> None:
         if not self._stopping:
             self.request_shutdown(signal.SIGTERM)
-        self._wait_or_kill(self.repeater_process)
-        self._wait_or_kill(self.manager_process)
+        if self.stop_plugins_first:
+            for process in (self.manager_process, self.repeater_process):
+                if process is not None:
+                    self._signal_process_group(process, self._shutdown_signal)
+                    self._wait_or_kill(process)
+        else:
+            self._wait_or_kill(self.repeater_process)
+            self._wait_or_kill(self.manager_process)
 
     def run(self) -> int:
         if self.manager_enabled:
@@ -197,7 +224,28 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    supervisor = ContainerSupervisor(args.config)
+    try:
+        with open(args.config, encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+        policy = shutdown_policy(config if isinstance(config, dict) else {})
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        logger.error("Cannot read plugin shutdown policy: %s", type(exc).__name__)
+        return 2
+    if managed_shutdown_configured(config if isinstance(config, dict) else {}):
+        # The deployment's own stop deadline (Docker stop_grace_period, the HA
+        # add-on stop timeout) must cover both service waits.
+        check_outer_deadline(
+            required_outer_timeout(policy.container_shutdown_timeout_seconds),
+            scope="container shutdown",
+        )
+    timeout = policy.container_shutdown_timeout_seconds
+    if managed_shutdown_configured(config if isinstance(config, dict) else {}):
+        timeout = effective_container_timeout(policy, advertised_stop_timeout_seconds())
+    supervisor = ContainerSupervisor(
+        args.config,
+        shutdown_timeout=timeout,
+        stop_plugins_first=policy.stop_before_repeater,
+    )
 
     def handle_signal(signum: int, _frame: Any) -> None:
         supervisor.request_shutdown(signum)

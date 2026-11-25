@@ -639,6 +639,10 @@ storage:
 # plugins:
 #   # Master switch for the openhop-plugin-manager service (default: enabled when omitted)
 #   enabled: true
+#   # Opt-in external-service drain budgets (seconds; see docs/plugins.md)
+#   # stop_timeout_seconds: 20
+#   # container_shutdown_timeout_seconds: 40
+#   # stop_before_repeater: true
 #   # Install root (default: {storage.storage_dir}/plugins)
 #   # root: "/var/lib/openhop_repeater/plugins"
 #   # Unix domain socket used by Repeater HTTP → plugin manager IPC

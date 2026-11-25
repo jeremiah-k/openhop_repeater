@@ -3,6 +3,13 @@ services:
     image: ${OPENHOP_REPEATER_IMAGE:-${PYMC_REPEATER_IMAGE:-openhop/openhop-repeater:main}}
     container_name: openhop-repeater
     restart: unless-stopped
+    # Stop deadline for the whole container, in seconds. The plugin manager
+    # drains the enabled service plugins sequentially before the repeater
+    # exits, so this must cover both service waits; see docs/plugins.md.
+    stop_grace_period: ${OPENHOP_STOP_TIMEOUT_SECONDS:-10}s
+    environment:
+      # Declares the deadline this deployment grants the repeater.
+      OPENHOP_STOP_TIMEOUT_SECONDS: "${OPENHOP_STOP_TIMEOUT_SECONDS:-10}"
     ports:
       - 8000:8000
     devices:

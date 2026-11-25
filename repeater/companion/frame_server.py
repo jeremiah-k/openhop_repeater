@@ -237,7 +237,10 @@ class CompanionFrameServer(_BaseFrameServer):
         for the client.  Returns ``(row_id, message)`` so exactly that row can
         be deleted afterwards.  The returned message carries the row's arrival
         number (its ``id`` when the row was stored without one) so the sync
-        path can order it against the in-memory queue.
+        path can order it against the in-memory queue, and the raw row dict
+        (``row_dict``, every column including the dedup key) so the sync path
+        can re-insert the row unchanged if the client disappears while the
+        delete runs.
 
         Raises when the store cannot be read; ``None`` means the queue is
         empty. The caller falls back to serving memory and drops the order
@@ -270,6 +273,10 @@ class CompanionFrameServer(_BaseFrameServer):
             msg.arrival_seq = int(msg_dict.get("arrival_seq", row_id))
         except AttributeError:
             pass  # a model that forbids new attributes: memory is served first
+        try:
+            msg.row_dict = msg_dict
+        except AttributeError:
+            pass  # a model that forbids new attributes: retirement cannot roll back
         return row_id, msg
 
     # -----------------------------------------------------------------
@@ -337,6 +344,19 @@ class CompanionFrameServer(_BaseFrameServer):
         row_id, msg = peeked
         if not self._write_frame(self._build_message_frame(msg)):
             return
+        # Retirement may only confirm an admission that still holds: the frame
+        # must belong to the client that is still the attached one, checked
+        # here under the same message lock that admitted it. A client that
+        # was replaced, evicted, closed, or is closing between admission and
+        # retirement keeps the row for its successor.
+        writer = self._client_writer
+        if self._write_queue is not queue or writer is None or writer.is_closing():
+            logger.info(
+                "Companion %s: client left between frame admission and retirement; "
+                "keeping the persisted row",
+                self.companion_hash,
+            )
+            return
         deleted = await asyncio.to_thread(
             self.sqlite_handler.companion_delete_message, self.companion_hash, row_id
         )
@@ -346,6 +366,60 @@ class CompanionFrameServer(_BaseFrameServer):
             logger.warning("Companion %s: queued message retirement failed", self.companion_hash)
             if self._write_queue is queue and self._client_writer is not None:
                 self._client_writer.close()
+            return
+        # The delete ran in a worker thread, so the client may have been
+        # replaced, evicted, or disconnected while it ran — the admitted frame
+        # would die with the old client's write queue. Roll the row back so a
+        # successor client is served instead.
+        current = self._client_writer
+        if (
+            self._write_queue is not queue
+            or current is not writer
+            or current is None
+            or current.is_closing()
+        ):
+            await self._rollback_retired_row(msg)
+
+    async def _rollback_retired_row(self, msg: QueuedMessage) -> None:
+        """Re-insert a row retired on behalf of a client that did not stay attached.
+
+        The raw row dict peeked from the store is written back verbatim
+        (including ``arrival_seq`` and the dedup key), so the successor client
+        is served the same message in the same order. If the store refuses the
+        re-insert because the row already exists again, the message is still
+        queued; any other refusal is logged loudly because the only copy was
+        the frame just dropped.
+        """
+        row_dict = getattr(msg, "row_dict", None)
+        if row_dict is None:
+            logger.error(
+                "Companion %s: cannot roll back the retired row (no row dict); "
+                "the message may be lost",
+                self.companion_hash,
+            )
+            return
+        retention = getattr(
+            self.bridge.message_queue,
+            "max_size",
+            getattr(self.bridge.message_queue, "_max_size", None),
+        )
+        restored = await asyncio.to_thread(
+            self.sqlite_handler.companion_push_message,
+            self.companion_hash,
+            row_dict,
+            retention,
+            row_dict.get("arrival_seq"),
+        )
+        if restored:
+            logger.info(
+                "Companion %s: kept the retired row for the next client", self.companion_hash
+            )
+        else:
+            logger.error(
+                "Companion %s: could not keep the retired row; the row was restored "
+                "or rejected by the store and must be verified",
+                self.companion_hash,
+            )
 
     @staticmethod
     def _contact_to_dict(c) -> dict:

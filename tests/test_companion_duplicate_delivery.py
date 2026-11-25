@@ -272,6 +272,7 @@ async def test_replaced_client_does_not_consume_persisted_row(tmp_path):
         sync = asyncio.create_task(fs._cmd_sync_next_message(b""))
         await _settle()
         fs._write_queue = asyncio.Queue()
+        fs._client_writer = _OpenWriter()
         await gate.release()
         await sync
     assert old_queue.empty() and fs._write_queue.empty()
@@ -309,6 +310,7 @@ async def test_message_whose_frame_could_not_be_queued_stays_deliverable(tmp_pat
     # A client connects: the message is queued for it once and its persisted
     # row is retired.
     fs._write_queue = asyncio.Queue(maxsize=16)
+    fs._client_writer = _OpenWriter()
     await fs._cmd_sync_next_message(b"")
     assert _delivered(fs._write_queue, "keep me")
     assert bridge.message_queue.count == 0
@@ -344,3 +346,22 @@ async def test_committed_sqlite_row_is_not_visible_to_sync_before_transfer_finis
     assert _delivered(fs._write_queue, "committed")
     assert handler.companion_count_messages(_HASH) == 0
     assert bridge.message_queue.is_empty()
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

@@ -4408,7 +4408,7 @@ class SQLiteHandler:
                     """
                     SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
                            path_len, sender_prefix, snr, rssi, channel_data_type,
-                           channel_data_payload, arrival_seq
+                           channel_data_payload, packet_hash, arrival_seq
                     FROM companion_messages WHERE companion_hash = ?
                     ORDER BY COALESCE(arrival_seq, id) ASC LIMIT 1
                 """,

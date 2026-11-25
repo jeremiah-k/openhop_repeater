@@ -154,6 +154,7 @@ async def test_frame_server_persistence_paths_and_stop():
         srv.companion_hash = "h"
         srv._message_lock = asyncio.Lock()
         srv._write_queue = asyncio.Queue()
+        srv._client_writer = _OpenWriter()
         srv._write_frame = MagicMock(return_value=True)
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
@@ -213,6 +214,7 @@ async def test_frame_server_no_more_messages_response_when_empty():
         srv.bridge = bridge
         srv._message_lock = asyncio.Lock()
         srv._write_queue = asyncio.Queue()
+        srv._client_writer = _OpenWriter()
         srv._write_frame = MagicMock(return_value=True)
         await srv._cmd_sync_next_message(b"")
         # RESP_CODE_NO_MORE_MESSAGES is encoded as a single-byte frame.
@@ -263,6 +265,7 @@ async def test_restart_queue_rows_are_delivered_once_from_sqlite():
         srv.companion_hash = "h"
         srv._message_lock = asyncio.Lock()
         srv._write_queue = asyncio.Queue()
+        srv._client_writer = _OpenWriter()
         srv._write_frame = MagicMock(return_value=True)
         srv._build_message_frame = lambda message: message.text.encode()
 
@@ -312,3 +315,22 @@ def test_companion_utils_validation_and_normalization():
         validate_companion_node_name("x" * 32)
     with pytest.raises(ValueError):
         validate_companion_node_name("bad\nname")
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

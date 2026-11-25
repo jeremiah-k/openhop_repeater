@@ -268,3 +268,22 @@ async def test_restart_keeps_persisted_rows_ahead_of_a_new_arrival(tmp_path):
     assert payloads[1].endswith(b"m2")
     assert payloads[2].endswith(b"after restart")
     assert restarted.companion_count_messages(_HASH) == 0
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

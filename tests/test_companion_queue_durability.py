@@ -273,3 +273,22 @@ async def test_bridge_queue_message_is_not_deleted_from_sqlite(tmp_path):
     assert len(payloads) == 1
     assert payloads[0].endswith(b"from bridge")
     assert handler.companion_count_messages(_HASH) == 0
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

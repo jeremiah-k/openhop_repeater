@@ -110,7 +110,9 @@ The manager starts enabled service plugins on boot and supervises crashes
 (restarts with a simple crash-loop limit: 5 unexpected exits in 60s → `FAILED`).
 With the managed shutdown policy enabled, crash supervision is retired before
 the first plugin is stopped, so a plugin that crashes while another plugin is
-being stopped is not started again during the drain. Without that policy the
+being stopped is not started again during the drain. A restart that is in
+flight when the drain begins completes first, and the drain stops that plugin
+before the manager exits. Without that policy the
 manager keeps the upstream order: it stops the plugins first and retires crash
 supervision afterwards.
 

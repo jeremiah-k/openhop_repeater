@@ -43,13 +43,13 @@ class _RecordingRuntime:
     def __init__(self):
         self.calls: list[str] = []
 
-    def running_plugin_ids(self) -> list[str]:
+    def running_plugin_ids(self, *, lock_wait=None) -> list[str]:
         return ["openhop.alpha"]
 
     def stop_supervisor(self) -> None:
         self.calls.append("stop_supervisor")
 
-    def stop(self, plugin_id: str, *, timeout=None) -> None:
+    def stop(self, plugin_id: str, *, timeout=None, lock_wait=None) -> None:
         self.calls.append("stop")
 
 

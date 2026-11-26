@@ -74,3 +74,4 @@ syncproxmox.sh
 
 #dev
 pyproject_dev.toml
+.zcode/

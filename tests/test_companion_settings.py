@@ -407,14 +407,15 @@ class TestSenderPrefixPersistence:
         import sqlite3
 
         # Build a current DB, then rewind companion_messages to the
-        # pre-sender_prefix schema and drop the migration marker.
+        # pre-sender_prefix schema and drop the migration markers.
         h = self._handler(tmp_path)
         conn = sqlite3.connect(str(h.sqlite_path))
         conn.execute(
             "DELETE FROM migrations "
             "WHERE migration_name IN ("
             "'add_sender_prefix_to_companion_messages', "
-            "'add_signal_and_channel_data_to_companion_messages')"
+            "'add_signal_and_channel_data_to_companion_messages', "
+            "'add_arrival_seq_to_companion_messages')"
         )
         conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
         conn.execute(
@@ -539,7 +540,7 @@ class TestPersistSkipWhenOff:
     def test_skips_persistence_when_retention_zero(self):
         import asyncio
 
-        entry = object()
+        entry = SimpleNamespace()  # bears __dict__, like a real QueuedMessage
         fs = self._frame_server(0)
         asyncio.run(fs._persist_companion_message({"text": "x"}, entry))
         fs.sqlite_handler.companion_push_message.assert_not_called()
@@ -550,7 +551,11 @@ class TestPersistSkipWhenOff:
 
         fs = self._frame_server(7)
         asyncio.run(fs._persist_companion_message({"text": "x"}))
-        fs.sqlite_handler.companion_push_message.assert_called_once_with("0x01", {"text": "x"}, 7)
+        # No queue entry to stamp, so the row is written without an arrival
+        # number and falls back to its row order.
+        fs.sqlite_handler.companion_push_message.assert_called_once_with(
+            "0x01", {"text": "x"}, 7, None
+        )
 
     def test_keeps_memory_message_when_sqlite_rejects_it(self):
         import asyncio

@@ -192,13 +192,15 @@ def test_load_messages_returns_new_fields_with_types(tmp_path):
 
 def test_legacy_schema_migrates_and_defaults(tmp_path):
     # Rewind companion_messages to the pre-change schema (sender_prefix present,
-    # but no snr/rssi/channel_data_type/channel_data_payload) and drop the
-    # migration marker, then re-run migrations against a pre-existing row.
+    # but no snr/rssi/channel_data_type/channel_data_payload/arrival_seq) and
+    # drop the migration markers, then re-run migrations against a
+    # pre-existing row.
     h = _handler(tmp_path)
     conn = sqlite3.connect(str(h.sqlite_path))
     conn.execute(
-        "DELETE FROM migrations "
-        "WHERE migration_name = 'add_signal_and_channel_data_to_companion_messages'"
+        "DELETE FROM migrations WHERE migration_name IN ("
+        "'add_signal_and_channel_data_to_companion_messages', "
+        "'add_arrival_seq_to_companion_messages')"
     )
     conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
     conn.execute(

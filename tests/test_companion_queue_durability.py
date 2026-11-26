@@ -44,7 +44,10 @@ def _frame_server(handler: SQLiteHandler) -> CompanionFrameServer:
     fs._app_target_ver = 3
     fs.sqlite_handler = handler
     fs.companion_hash = _HASH
-    fs.bridge = SimpleNamespace(sync_next_message=lambda: None)
+    fs.bridge = SimpleNamespace(
+        sync_next_message=lambda: None,
+        message_queue=SimpleNamespace(peek=lambda: None),
+    )
     fs._write_queue = None
     return fs
 
@@ -65,9 +68,30 @@ def _persist(handler: SQLiteHandler, text: str, **overrides) -> None:
 
 
 def _attach_client(fs: CompanionFrameServer) -> asyncio.Queue:
-    """Attach a client write queue and return it."""
+    """Attach a client write queue behind a live transport double."""
     fs._write_queue = asyncio.Queue(maxsize=16)
+    fs._client_writer = _OpenWriter()
     return fs._write_queue
+
+
+class _OpenWriter:
+    """A live attached-transport double for the admission gate."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False
+
 
 
 def _queued_payloads(queue: asyncio.Queue) -> list[bytes]:

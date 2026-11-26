@@ -818,6 +818,42 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # Migration 17: Arrival sequence for companion queued messages.
+                #
+                # Sync merges the in-memory offline queue and the persisted rows
+                # by this number, so a newer in-memory message cannot overtake
+                # an older persisted one. Existing rows are backfilled with
+                # their id, which already is their arrival order; rows written
+                # later without a number fall back to that same row order when
+                # read.
+                migration_name = "add_arrival_seq_to_companion_messages"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_messages)")
+                    columns = [column[1] for column in cursor.fetchall()]
+
+                    if "arrival_seq" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages ADD COLUMN arrival_seq INTEGER"
+                        )
+                        logger.info("Added arrival_seq column to companion_messages table")
+
+                    conn.execute(
+                        "UPDATE companion_messages SET arrival_seq = id WHERE arrival_seq IS NULL"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_companion_messages_arrival "
+                        "ON companion_messages(companion_hash, arrival_seq)"
+                    )
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 conn.commit()
 
         except Exception as e:
@@ -4161,7 +4197,11 @@ class SQLiteHandler:
             return None
 
     def companion_push_message(
-        self, companion_hash: str, msg: Dict, max_messages: Optional[int] = None
+        self,
+        companion_hash: str,
+        msg: Dict,
+        max_messages: Optional[int] = None,
+        arrival_seq: Optional[int] = None,
     ) -> bool:
         """Append a message to the companion's queue.
 
@@ -4174,6 +4214,11 @@ class SQLiteHandler:
         policy: evict the oldest channel message first and never displace a
         retained direct message. The insert and any eviction share one
         transaction.
+
+        ``arrival_seq`` is the arrival number the frame server assigned to the
+        message, stored so sync can merge both queues in arrival order. Rows
+        written without one fall back to their row order, which is their
+        arrival order.
 
         Returns True if the message is retained, False if it is a duplicate or
         the protected queue cannot make room for it.
@@ -4195,8 +4240,9 @@ class SQLiteHandler:
                     INSERT OR IGNORE INTO companion_messages
                     (companion_hash, sender_key, txt_type, timestamp, text,
                      is_channel, channel_idx, path_len, sender_prefix, snr, rssi,
-                     channel_data_type, channel_data_payload, packet_hash, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     channel_data_type, channel_data_payload, packet_hash, created_at,
+                     arrival_seq)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         companion_hash,
@@ -4214,6 +4260,7 @@ class SQLiteHandler:
                         bytes(msg.get("channel_data_payload") or b""),
                         packet_hash,
                         time.time(),
+                        arrival_seq,
                     ),
                 )
                 inserted = cursor.rowcount > 0
@@ -4292,7 +4339,7 @@ class SQLiteHandler:
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
                     FROM companion_messages WHERE companion_hash = ?
-                    ORDER BY id ASC LIMIT 1
+                    ORDER BY COALESCE(arrival_seq, id) ASC LIMIT 1
                 """,
                     (companion_hash,),
                 )
@@ -4307,12 +4354,52 @@ class SQLiteHandler:
             logger.error(f"Failed to pop companion message: {e}")
             return None
 
+    def companion_max_arrival_seq(self, companion_hash: str) -> Optional[int]:
+        """Return the highest arrival number outstanding for a companion.
+
+        Rows written before the arrival_seq migration have no number; their id
+        (insertion order, which is their arrival order) stands in for one. The
+        frame server seeds its arrival counter above this value after a
+        restart, so new arrivals always sort behind the backlog that is
+        already persisted.
+
+        Returns None when the read fails, so the caller can degrade instead of
+        silently reordering against an unknown backlog.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT MAX(COALESCE(arrival_seq, id)) FROM companion_messages
+                    WHERE companion_hash = ?
+                """,
+                    (companion_hash,),
+                ).fetchone()
+                if row and row[0] is not None:
+                    return int(row[0])
+                return 0
+        except Exception:
+            logger.error(
+                f"Failed to read companion arrival sequence for {companion_hash}", exc_info=True
+            )
+            return None
+
     def companion_peek_message(self, companion_hash: str) -> Optional[tuple[int, Dict]]:
         """Return the oldest queued message *without* removing it.
 
         Returns ``(row_id, message)`` so the caller can delete exactly that
         row once the message has really been handed to the client, or ``None``
-        when the queue is empty (or the read failed).
+        when the queue is empty. The message dict carries ``arrival_seq``;
+        a row stored without an arrival number reports its row id instead,
+        because the row order is its arrival order.
+
+        The oldest message is the lowest arrival number, not the lowest row
+        id: a persist retried after a locked store lands its row when the
+        lock lifts, so row ids follow insert time while ``arrival_seq``
+        preserves the true arrival order.
+
+        Raises when the read fails, so the caller can fall back rather than
+        treat a locked or broken store as "no messages".
         """
         try:
             with self._connect() as conn:
@@ -4321,19 +4408,23 @@ class SQLiteHandler:
                     """
                     SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
                            path_len, sender_prefix, snr, rssi, channel_data_type,
-                           channel_data_payload
+                           channel_data_payload, arrival_seq
                     FROM companion_messages WHERE companion_hash = ?
-                    ORDER BY id ASC LIMIT 1
+                    ORDER BY COALESCE(arrival_seq, id) ASC LIMIT 1
                 """,
                     (companion_hash,),
                 )
                 row = cursor.fetchone()
                 if not row:
                     return None
-                return int(row["id"]), self._companion_message_from_row(row)
-        except Exception as e:
-            logger.error(f"Failed to peek companion message: {e}")
-            return None
+                msg = self._companion_message_from_row(row)
+                msg["arrival_seq"] = (
+                    int(row["arrival_seq"]) if row["arrival_seq"] is not None else int(row["id"])
+                )
+                return int(row["id"]), msg
+        except Exception:
+            logger.error(f"Failed to peek companion message for {companion_hash}", exc_info=True)
+            raise
 
     def companion_delete_message(self, companion_hash: str, message_id: int) -> bool:
         """Delete one queued message by row id.

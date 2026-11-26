@@ -41,7 +41,28 @@ def _server(handler: SQLiteHandler, bridge: _Bridge) -> CompanionFrameServer:
     fs.companion_hash = _HASH
     fs.bridge = bridge
     fs._write_queue = asyncio.Queue(maxsize=16)
+    fs._client_writer = _OpenWriter()
     return fs
+
+
+class _OpenWriter:
+    """A live attached-transport double for the admission gate."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False
+
 
 
 def _msg(text: str, key_byte: bytes, packet_hash: str, *, is_channel: bool = False):
@@ -305,7 +326,7 @@ async def test_committed_sqlite_row_is_not_visible_to_sync_before_transfer_finis
 
     async def held_write(func, /, *args, **kwargs):
         result = await real_to_thread(func, *args, **kwargs)
-        if func == handler.companion_push_message:
+        if getattr(func, "__name__", "") == "_stamp_and_push":
             committed.set()
             await release.wait()
         return result

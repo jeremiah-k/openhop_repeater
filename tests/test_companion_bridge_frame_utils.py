@@ -113,6 +113,7 @@ def test_bridge_load_prefs_ignores_invalid_or_missing_backend():
 async def test_frame_server_persistence_paths_and_stop():
     sqlite = SimpleNamespace(
         companion_push_message=MagicMock(),
+        companion_max_arrival_seq=MagicMock(return_value=0),
         companion_peek_message=MagicMock(
             return_value=(
                 11,
@@ -133,7 +134,9 @@ async def test_frame_server_persistence_paths_and_stop():
         companion_upsert_contact=MagicMock(),
     )
     bridge = SimpleNamespace(
-        message_queue=SimpleNamespace(remove=MagicMock(), pop_last=MagicMock()),
+        message_queue=SimpleNamespace(
+            remove=MagicMock(), pop_last=MagicMock(), peek=MagicMock(return_value=None)
+        ),
         sync_next_message=lambda: None,
         get_contacts=lambda: [],
         channels=SimpleNamespace(max_channels=2),
@@ -154,9 +157,9 @@ async def test_frame_server_persistence_paths_and_stop():
         srv._write_frame = MagicMock(return_value=True)
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
-        entry = object()
+        entry = SimpleNamespace()  # bears __dict__, like a real QueuedMessage
         await srv._persist_companion_message({"text": "x"}, entry)
-        sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"}, None)
+        sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"}, None, 1)
         bridge.message_queue.remove.assert_called_once_with(entry)
 
         peeked = srv._sync_next_from_persistence()
@@ -247,7 +250,10 @@ async def test_restart_queue_rows_are_delivered_once_from_sqlite():
             (2, {"sender_key": b"b", "timestamp": 2, "text": "second"}),
         ]
     )
-    bridge = SimpleNamespace(sync_next_message=lambda: None)
+    bridge = SimpleNamespace(
+        sync_next_message=lambda: None,
+        message_queue=SimpleNamespace(peek=lambda: None),
+    )
 
     with patch(
         "repeater.companion.frame_server._BaseFrameServer.__init__", lambda self, **kwargs: None

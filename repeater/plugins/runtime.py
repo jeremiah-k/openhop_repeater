@@ -12,10 +12,11 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from .manifest import PluginManifest, read_archive_member, ui_subtree, validate_archive_limits
 from .storage import PluginPaths, PluginStorage, write_release_asset
@@ -654,10 +655,33 @@ class PluginRuntime:
         except (OSError, ValueError):
             logger.debug("Plugin log stream closed for %s", handle.plugin_id)
 
-    def running_plugin_ids(self) -> list[str]:
+    def running_plugin_ids(self, *, lock_wait: Optional[float] = None) -> list[str]:
         """Plugin ids with a live process handle."""
-        with self._lock:
+        with self._runtime_lock(lock_wait):
             return list(self._handles)
+
+    @contextmanager
+    def _runtime_lock(self, wait: Optional[float]) -> Iterator[None]:
+        """Hold the runtime lock, optionally bounded for shutdown callers.
+
+        ``None`` keeps the ordinary unbounded acquisition. A bounded caller
+        that times out raises instead of spending the shutdown budget
+        waiting on a restart that still holds the lock.
+        """
+        if wait is None:
+            with self._lock:
+                yield
+            return
+        if not self._lock.acquire(timeout=max(0.0, float(wait))):
+            logger.warning(
+                "Stop budget elapsed waiting for the plugin runtime lock; "
+                "a restart is still in flight and the stop is skipped"
+            )
+            raise RuntimeError("plugin runtime lock busy; stop skipped")
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def stop(
         self,
@@ -665,8 +689,13 @@ class PluginRuntime:
         *,
         mark_disabled: bool = False,
         timeout: Optional[float] = None,
+        lock_wait: Optional[float] = None,
     ) -> PluginState:
-        with self._lock:
+        # One stop shares its lock allowance across both acquisitions: the
+        # SIGTERM grace between them must not reset the bounded caller's
+        # budget.
+        entered = time.monotonic()
+        with self._runtime_lock(lock_wait):
             handle = self._handles.get(plugin_id)
             self._runtime_state[plugin_id] = (
                 PluginState.DISABLED if mark_disabled else PluginState.STOPPING
@@ -680,7 +709,10 @@ class PluginRuntime:
         # Keep the group identity captured at spawn even if the leader exited.
         self._terminate_handle(handle, timeout=timeout)
 
-        with self._lock:
+        second_wait = (
+            None if lock_wait is None else max(0.0, float(lock_wait) - (time.monotonic() - entered))
+        )
+        with self._runtime_lock(second_wait):
             self._cleanup_handle(plugin_id)
             self._runtime_state[plugin_id] = (
                 PluginState.DISABLED if mark_disabled else PluginState.STOPPED
@@ -823,6 +855,17 @@ class PluginRuntime:
                         self.crash_window,
                     )
                     self._runtime_state[plugin_id] = PluginState.FAILED
+                    continue
+
+                if self._supervise_stop.is_set():
+                    # A supervisor that has been told to stop admits no
+                    # restarts: leave the plugin the way an expected stop
+                    # leaves it. The drain stops it like any other plugin.
+                    self._runtime_state[plugin_id] = PluginState.STOPPED
+                    logger.info(
+                        "Supervisor stopping; skipped restart of crashed plugin %s",
+                        plugin_id,
+                    )
                     continue
 
                 # Restart

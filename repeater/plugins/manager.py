@@ -263,14 +263,28 @@ class PluginManager:
         # shutdown budget and can rebuild a plugin virtualenv.
         self.runtime.stop_supervisor()
         plugin_ids = list(self.storage.list_plugin_ids())
-        grace = self._drain_grace_seconds()
+        # A restart that was already in flight when the drain began holds the
+        # runtime lock while it completes and can take far longer than one
+        # plugin's stop cost. Each stop therefore gets one lock allowance,
+        # sized from what is left of the shutdown budget after its SIGTERM
+        # grace and shared by the stop's two lock acquisitions, so the lock
+        # waits plus the per-plugin grace stay inside the budget. A stop that
+        # cannot take the lock in time is skipped, and the deployment's outer
+        # wait and kill escalation cover the leftover process instead of the
+        # drain overrunning its deadline.
+        deadline = time.monotonic() + effective_stop_budget(
+            self.shutdown_policy, self.granted_stop_seconds
+        )
+        grace = self._drain_grace_seconds(max(0.0, deadline - time.monotonic()))
         for plugin_id in plugin_ids:
+            remaining = max(0.0, deadline - time.monotonic())
+            lock_wait = remaining if grace is None else max(0.0, remaining - grace)
             try:
-                self.runtime.stop(plugin_id, timeout=grace)
+                self.runtime.stop(plugin_id, timeout=grace, lock_wait=lock_wait)
             except Exception as exc:
                 logger.debug("stop_all %s: %s", plugin_id, exc)
 
-    def _drain_grace_seconds(self) -> Optional[float]:
+    def _drain_grace_seconds(self, lock_wait: Optional[float] = None) -> Optional[float]:
         """Per-plugin SIGTERM grace that keeps the sequential drain bounded.
 
         The manager stops plugins one after another, so a per-plugin grace
@@ -280,7 +294,13 @@ class PluginManager:
         policy = self.shutdown_policy
         if policy is None:
             return None
-        draining = self.runtime.running_plugin_ids()
+        try:
+            draining = self.runtime.running_plugin_ids(lock_wait=lock_wait)
+        except RuntimeError:
+            # A restart still holds the runtime lock. Size the grace from the
+            # installed plugins instead: the larger count yields the smaller
+            # grace, which keeps the drain inside the budget.
+            draining = list(self.storage.list_plugin_ids())
         if not draining:
             return None
         budget = effective_stop_budget(policy, self.granted_stop_seconds)

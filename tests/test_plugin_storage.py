@@ -77,3 +77,76 @@ def test_uninstall_delete_data(tmp_path: Path):
     storage.write_state(plugin_id, {"version": "1.0.0", "enabled": True})
     storage.remove_release_code(plugin_id, keep_data=False)
     assert not paths.data_dir.exists()
+
+
+def test_runtime_file_has_a_bounded_regular_file_contract(tmp_path):
+    import os
+
+    storage = PluginStorage(tmp_path / "plugins")
+    plugin_id = "openhop.demo"
+    storage.ensure_plugin_layout(plugin_id, "1.0.0")
+    path = storage.runtime_path(plugin_id)
+    assert storage.read_runtime(plugin_id) == {}
+    path.write_text('{"ok": true}')
+    assert storage.read_runtime(plugin_id) == {"ok": True}
+    path.write_bytes(b" " * (64 * 1024 + 1))
+    with pytest.raises(ValueError, match="byte limit"):
+        storage.read_runtime(plugin_id)
+    path.unlink()
+    path.symlink_to(tmp_path / "other")
+    (tmp_path / "other").write_text('{"private": true}')
+    with pytest.raises(ValueError, match="invalid"):
+        storage.read_runtime(plugin_id)
+    path.unlink()
+    os.mkfifo(path)
+    with pytest.raises(ValueError, match="regular file"):
+        storage.read_runtime(plugin_id)
+
+
+def test_runtime_read_refuses_a_symlinked_data_directory(tmp_path):
+    storage = PluginStorage(tmp_path / "plugins")
+    plugin_id = "openhop.demo"
+    storage.ensure_plugin_layout(plugin_id, "1.0.0")
+    paths = storage.paths_for(plugin_id)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "runtime.json").write_text('{"ok": true}')
+    paths.data_dir.rmdir()
+    paths.data_dir.symlink_to(outside)
+    with pytest.raises(ValueError, match="invalid"):
+        storage.read_runtime(plugin_id)
+
+
+def test_runtime_read_refuses_a_symlinked_plugin_directory(tmp_path):
+    import shutil
+
+    storage = PluginStorage(tmp_path / "plugins")
+    plugin_id = "openhop.demo"
+    storage.ensure_plugin_layout(plugin_id, "1.0.0")
+    paths = storage.paths_for(plugin_id)
+    outside = tmp_path / "outside"
+    (outside / "data").mkdir(parents=True)
+    (outside / "data" / "runtime.json").write_text('{"ok": true}')
+    shutil.rmtree(paths.plugin_dir)
+    paths.plugin_dir.symlink_to(outside)
+    with pytest.raises(ValueError, match="invalid"):
+        storage.read_runtime(plugin_id)
+
+
+def test_runtime_parse_normalises_digit_limit_and_rejects_null(tmp_path):
+    storage = PluginStorage(tmp_path / "plugins")
+    plugin_id = "openhop.demo"
+    storage.ensure_plugin_layout(plugin_id, "1.0.0")
+    path = storage.runtime_path(plugin_id)
+    # An integer above Python's digit limit raises a plain ValueError that
+    # must not escape the promised invalid-runtime error.
+    path.write_bytes(b'{"n": 1' + b"0" * 5000 + b"}")
+    with pytest.raises(ValueError, match="invalid"):
+        storage.read_runtime(plugin_id)
+    # The documented observation is a JSON object: a parsed null is invalid;
+    # only a missing file reads as empty.
+    path.write_text("null")
+    with pytest.raises(ValueError, match="JSON object"):
+        storage.read_runtime(plugin_id)
+    path.unlink()
+    assert storage.read_runtime(plugin_id) == {}

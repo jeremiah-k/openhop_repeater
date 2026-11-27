@@ -23,6 +23,10 @@ ExecStart=/opt/openhop_repeater/venv/bin/openhop-plugin-manager --config /etc/op
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
+# The deadline this unit grants the plugin manager process. Raise it together
+# with TimeoutStopSec when enabling the managed shutdown policy; the manager
+# bounds its plugin drain to it. See docs/plugins.md.
+Environment=OPENHOP_MANAGER_STOP_TIMEOUT_SECONDS=15
 
 MemoryHigh=256M
 

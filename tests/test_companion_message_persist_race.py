@@ -34,6 +34,7 @@ class _Bridge:
 
 def _server(handler: SQLiteHandler, bridge: _Bridge) -> CompanionFrameServer:
     fs = CompanionFrameServer.__new__(CompanionFrameServer)
+    fs._message_lock = asyncio.Lock()
     fs.sqlite_handler = handler
     fs.companion_hash = _HASH
     fs.bridge = bridge
@@ -112,8 +113,7 @@ async def _settle() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("order", ["a_first", "b_first"])
-async def test_interleaved_persist_no_dup_no_loss(tmp_path, order):
+async def test_interleaved_persist_no_dup_no_loss(tmp_path):
     """Two receive tasks persist concurrently; regardless of completion order the
     older message ends up only in SQLite and the newer only in memory."""
     handler = SQLiteHandler(tmp_path)
@@ -135,12 +135,10 @@ async def test_interleaved_persist_no_dup_no_loss(tmp_path, order):
         task_b = asyncio.create_task(fs._persist_companion_message(dict_new, entry_new))
         await _settle()
 
-        if order == "a_first":
-            await gate.release(0)
-            await gate.release(1)
-        else:
-            await gate.release(1)
-            await gate.release(0)
+        assert len(gate.releases) == 1
+        await gate.release(0)
+        await _settle()
+        await gate.release(1)
         await asyncio.gather(task_a, task_b)
 
     memory = _memory_texts(bridge.message_queue)

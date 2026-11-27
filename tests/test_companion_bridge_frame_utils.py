@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
@@ -112,23 +113,30 @@ def test_bridge_load_prefs_ignores_invalid_or_missing_backend():
 async def test_frame_server_persistence_paths_and_stop():
     sqlite = SimpleNamespace(
         companion_push_message=MagicMock(),
-        companion_pop_message=MagicMock(
-            return_value={
-                "sender_key": b"k",
-                "txt_type": 1,
-                "timestamp": 2,
-                "text": "hello",
-                "is_channel": True,
-                "channel_idx": 3,
-                "path_len": 1,
-            }
+        companion_max_arrival_seq=MagicMock(return_value=0),
+        companion_peek_message=MagicMock(
+            return_value=(
+                11,
+                {
+                    "sender_key": b"k",
+                    "txt_type": 1,
+                    "timestamp": 2,
+                    "text": "hello",
+                    "is_channel": True,
+                    "channel_idx": 3,
+                    "path_len": 1,
+                },
+            )
         ),
+        companion_delete_message=MagicMock(return_value=True),
         companion_save_contacts=MagicMock(),
         companion_save_channels=MagicMock(),
         companion_upsert_contact=MagicMock(),
     )
     bridge = SimpleNamespace(
-        message_queue=SimpleNamespace(remove=MagicMock(), pop_last=MagicMock()),
+        message_queue=SimpleNamespace(
+            remove=MagicMock(), pop_last=MagicMock(), peek=MagicMock(return_value=None)
+        ),
         sync_next_message=lambda: None,
         get_contacts=lambda: [],
         channels=SimpleNamespace(max_channels=2),
@@ -144,20 +152,37 @@ async def test_frame_server_persistence_paths_and_stop():
         srv = CompanionFrameServer(bridge=bridge, companion_hash="h", sqlite_handler=sqlite)
         srv.bridge = bridge
         srv.companion_hash = "h"
-        srv._write_frame = MagicMock()
+        srv._message_lock = asyncio.Lock()
+        srv._write_queue = asyncio.Queue()
+        srv._client_writer = _OpenWriter()
+        srv._write_frame = MagicMock(return_value=True)
         srv._build_message_frame = MagicMock(return_value=b"frame")
 
-        entry = object()
+        entry = SimpleNamespace()  # bears __dict__, like a real QueuedMessage
         await srv._persist_companion_message({"text": "x"}, entry)
-        sqlite.companion_push_message.assert_called_once_with("h", {"text": "x"}, None)
+        # The entry bears no admission number (a bare namespace), so the row
+        # is written without one and falls back to its row order at read time.
+        sqlite.companion_push_message.assert_called_once_with(
+            "h",
+            {"text": "x"},
+            None,
+            None,
+            busy_timeout_ms=CompanionFrameServer._STORE_BUSY_TIMEOUT_MS,
+        )
         bridge.message_queue.remove.assert_called_once_with(entry)
 
-        msg = srv._sync_next_from_persistence()
-        assert msg is not None
+        peeked = srv._sync_next_from_persistence()
+        assert peeked is not None
+        row_id, msg = peeked
+        assert row_id == 11
         assert msg.text == "hello"
 
         await srv._cmd_sync_next_message(b"")
         srv._write_frame.assert_called_once_with(b"frame")
+        # The row is only deleted once the frame has been queued.
+        sqlite.companion_delete_message.assert_called_once_with(
+            "h", 11, CompanionFrameServer._STORE_BUSY_TIMEOUT_MS
+        )
 
         contact = SimpleNamespace(
             public_key=b"\x01\x02",
@@ -197,7 +222,10 @@ async def test_frame_server_no_more_messages_response_when_empty():
     ):
         srv = CompanionFrameServer(bridge=bridge, companion_hash="h", sqlite_handler=None)
         srv.bridge = bridge
-        srv._write_frame = MagicMock()
+        srv._message_lock = asyncio.Lock()
+        srv._write_queue = asyncio.Queue()
+        srv._client_writer = _OpenWriter()
+        srv._write_frame = MagicMock(return_value=True)
         await srv._cmd_sync_next_message(b"")
         # RESP_CODE_NO_MORE_MESSAGES is encoded as a single-byte frame.
         assert srv._write_frame.call_args[0][0] == bytes([RESP_CODE_NO_MORE_MESSAGES])
@@ -205,16 +233,39 @@ async def test_frame_server_no_more_messages_response_when_empty():
 
 @pytest.mark.asyncio
 async def test_restart_queue_rows_are_delivered_once_from_sqlite():
-    sqlite = SimpleNamespace(
-        companion_pop_message=MagicMock(
-            side_effect=[
-                {"sender_key": b"a", "timestamp": 1, "text": "first"},
-                {"sender_key": b"b", "timestamp": 2, "text": "second"},
-                None,
-            ]
-        )
+    class _FakeStore:
+        """A queued-message store that only drops a row once it is deleted."""
+
+        def __init__(self, rows):
+            self.rows = list(rows)
+            self.peeks = 0
+            self.deleted = []
+
+        def companion_peek_message(self, companion_hash, busy_timeout_ms=None):
+            self.peeks += 1
+            if not self.rows:
+                return None
+            row_id, msg = self.rows[0]
+            return row_id, dict(msg)
+
+        def companion_delete_message(self, companion_hash, row_id, busy_timeout_ms=None):
+            for index, (rid, _) in enumerate(self.rows):
+                if rid == row_id:
+                    self.rows.pop(index)
+                    self.deleted.append(row_id)
+                    return True
+            return False
+
+    sqlite = _FakeStore(
+        [
+            (1, {"sender_key": b"a", "timestamp": 1, "text": "first"}),
+            (2, {"sender_key": b"b", "timestamp": 2, "text": "second"}),
+        ]
     )
-    bridge = SimpleNamespace(sync_next_message=lambda: None)
+    bridge = SimpleNamespace(
+        sync_next_message=lambda: None,
+        message_queue=SimpleNamespace(peek=lambda: None),
+    )
 
     with patch(
         "repeater.companion.frame_server._BaseFrameServer.__init__", lambda self, **kwargs: None
@@ -222,7 +273,10 @@ async def test_restart_queue_rows_are_delivered_once_from_sqlite():
         srv = CompanionFrameServer(bridge=bridge, companion_hash="h", sqlite_handler=sqlite)
         srv.bridge = bridge
         srv.companion_hash = "h"
-        srv._write_frame = MagicMock()
+        srv._message_lock = asyncio.Lock()
+        srv._write_queue = asyncio.Queue()
+        srv._client_writer = _OpenWriter()
+        srv._write_frame = MagicMock(return_value=True)
         srv._build_message_frame = lambda message: message.text.encode()
 
         await srv._cmd_sync_next_message(b"")
@@ -234,7 +288,9 @@ async def test_restart_queue_rows_are_delivered_once_from_sqlite():
         b"second",
         bytes([RESP_CODE_NO_MORE_MESSAGES]),
     ]
-    assert sqlite.companion_pop_message.call_count == 3
+    # Each row is deleted exactly once, after it has been queued.
+    assert sqlite.deleted == [1, 2]
+    assert sqlite.rows == []
 
 
 @pytest.mark.asyncio
@@ -269,3 +325,22 @@ def test_companion_utils_validation_and_normalization():
         validate_companion_node_name("x" * 32)
     with pytest.raises(ValueError):
         validate_companion_node_name("bad\nname")
+
+
+class _OpenWriter:
+    """A live attached-transport double for tests that stub the write queue."""
+
+    def write(self, _data):
+        return None
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+    async def wait_closed(self):
+        return None
+
+    def is_closing(self):
+        return False

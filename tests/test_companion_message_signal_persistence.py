@@ -125,8 +125,9 @@ def test_frame_round_trip_is_byte_identical(tmp_path, msg_dict):
     original_frame = fs._build_message_frame(_qm_from_dict(msg_dict))
 
     assert h.companion_push_message(_HASH, dict(msg_dict))
-    rebuilt = fs._sync_next_from_persistence()
-    assert rebuilt is not None
+    peeked = fs._sync_next_from_persistence()
+    assert peeked is not None
+    _, rebuilt = peeked
     rebuilt_frame = fs._build_message_frame(rebuilt)
 
     assert rebuilt_frame == original_frame
@@ -139,7 +140,9 @@ def test_channel_data_survives_as_binary_frame_not_empty_text(tmp_path):
     fs = _frame_server(h)
 
     assert h.companion_push_message(_HASH, dict(_CHANNEL_DATA))
-    rebuilt = fs._sync_next_from_persistence()
+    peeked = fs._sync_next_from_persistence()
+    assert peeked is not None
+    _, rebuilt = peeked
 
     assert rebuilt.channel_data_type == 0x0102
     assert rebuilt.channel_data_payload == b"\x01\x02\x03\xff\x10"
@@ -189,13 +192,15 @@ def test_load_messages_returns_new_fields_with_types(tmp_path):
 
 def test_legacy_schema_migrates_and_defaults(tmp_path):
     # Rewind companion_messages to the pre-change schema (sender_prefix present,
-    # but no snr/rssi/channel_data_type/channel_data_payload) and drop the
-    # migration marker, then re-run migrations against a pre-existing row.
+    # but no snr/rssi/channel_data_type/channel_data_payload/arrival_seq) and
+    # drop the migration markers, then re-run migrations against a
+    # pre-existing row.
     h = _handler(tmp_path)
     conn = sqlite3.connect(str(h.sqlite_path))
     conn.execute(
-        "DELETE FROM migrations "
-        "WHERE migration_name = 'add_signal_and_channel_data_to_companion_messages'"
+        "DELETE FROM migrations WHERE migration_name IN ("
+        "'add_signal_and_channel_data_to_companion_messages', "
+        "'add_arrival_seq_to_companion_messages')"
     )
     conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
     conn.execute(

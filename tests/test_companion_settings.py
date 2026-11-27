@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -406,14 +407,15 @@ class TestSenderPrefixPersistence:
         import sqlite3
 
         # Build a current DB, then rewind companion_messages to the
-        # pre-sender_prefix schema and drop the migration marker.
+        # pre-sender_prefix schema and drop the migration markers.
         h = self._handler(tmp_path)
         conn = sqlite3.connect(str(h.sqlite_path))
         conn.execute(
             "DELETE FROM migrations "
             "WHERE migration_name IN ("
             "'add_sender_prefix_to_companion_messages', "
-            "'add_signal_and_channel_data_to_companion_messages')"
+            "'add_signal_and_channel_data_to_companion_messages', "
+            "'add_arrival_seq_to_companion_messages')"
         )
         conn.execute("ALTER TABLE companion_messages RENAME TO companion_messages_old")
         conn.execute(
@@ -455,17 +457,23 @@ class TestSenderPrefixPersistence:
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
-        fs.sqlite_handler.companion_pop_message.return_value = {
-            "sender_key": b"\x01" * 32,
-            "txt_type": 2,
-            "timestamp": 42,
-            "text": "signed post",
-            "is_channel": 0,
-            "channel_idx": 0,
-            "path_len": 0,
-            "sender_prefix": self.PREFIX,
-        }
-        msg = fs._sync_next_from_persistence()
+        fs.sqlite_handler.companion_peek_message.return_value = (
+            7,
+            {
+                "sender_key": b"\x01" * 32,
+                "txt_type": 2,
+                "timestamp": 42,
+                "text": "signed post",
+                "is_channel": 0,
+                "channel_idx": 0,
+                "path_len": 0,
+                "sender_prefix": self.PREFIX,
+            },
+        )
+        peeked = fs._sync_next_from_persistence()
+        assert peeked is not None
+        row_id, msg = peeked
+        assert row_id == 7
         assert msg.sender_prefix == self.PREFIX
 
 
@@ -521,6 +529,7 @@ class TestPersistSkipWhenOff:
         from repeater.companion.frame_server import CompanionFrameServer
 
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
+        fs._message_lock = asyncio.Lock()
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
         bridge = MagicMock()
@@ -531,7 +540,7 @@ class TestPersistSkipWhenOff:
     def test_skips_persistence_when_retention_zero(self):
         import asyncio
 
-        entry = object()
+        entry = SimpleNamespace()  # bears __dict__, like a real QueuedMessage
         fs = self._frame_server(0)
         asyncio.run(fs._persist_companion_message({"text": "x"}, entry))
         fs.sqlite_handler.companion_push_message.assert_not_called()
@@ -542,7 +551,11 @@ class TestPersistSkipWhenOff:
 
         fs = self._frame_server(7)
         asyncio.run(fs._persist_companion_message({"text": "x"}))
-        fs.sqlite_handler.companion_push_message.assert_called_once_with("0x01", {"text": "x"}, 7)
+        # No queue entry to stamp, so the row is written without an arrival
+        # number and falls back to its row order.
+        fs.sqlite_handler.companion_push_message.assert_called_once_with(
+            "0x01", {"text": "x"}, 7, None, busy_timeout_ms=fs._STORE_BUSY_TIMEOUT_MS
+        )
 
     def test_keeps_memory_message_when_sqlite_rejects_it(self):
         import asyncio

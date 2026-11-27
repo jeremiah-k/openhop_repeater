@@ -13,6 +13,10 @@ logger = logging.getLogger("SQLiteHandler")
 
 
 class SQLiteHandler:
+    # The busy handler armed on every new connection and restored on a cached
+    # connection after a bounded (`busy_timeout_ms`) call ran on it.
+    _DEFAULT_BUSY_TIMEOUT_MS = 5000
+
     def __init__(self, storage_dir: Path):
         self.storage_dir = storage_dir
         self.sqlite_path = self.storage_dir / "repeater.db"
@@ -45,7 +49,7 @@ class SQLiteHandler:
         self._init_database()
         self._run_migrations()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, busy_timeout_ms: Optional[int] = None) -> sqlite3.Connection:
         """Return a persistent thread-local SQLite connection.
 
         The first call from a given thread opens the connection and configures
@@ -70,14 +74,33 @@ class SQLiteHandler:
           'database is locked'.  5 s of automatic retry eliminates transient
           contention errors when the write executor and the HTTP thread
           briefly compete for the WAL write lock.
+
+        ``busy_timeout_ms`` bounds the busy handler for the call that asks for
+        it.  The bound is applied to the thread's cached connection and the
+        5 s default is restored on that connection's next unbounded call, so a
+        short bound can never leak into later operations.  The companion
+        queue's frame-server paths pass a short bound so a locked store
+        degrades within a moment instead of stalling a sync or a persist for
+        the default 5 s; calls on one thread are serial, so the bound cannot
+        leak into a concurrent caller.
         """
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(str(self.sqlite_path))
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA busy_timeout={self._DEFAULT_BUSY_TIMEOUT_MS}")
             self._local.conn = conn
+            self._local.busy_timeout_ms = self._DEFAULT_BUSY_TIMEOUT_MS
+        timeout = None if busy_timeout_ms is None else int(busy_timeout_ms)
+        if timeout is not None and timeout != self._local.busy_timeout_ms:
+            conn.execute(f"PRAGMA busy_timeout={timeout}")
+            self._local.busy_timeout_ms = timeout
+        elif timeout is None and self._local.busy_timeout_ms != self._DEFAULT_BUSY_TIMEOUT_MS:
+            # A previous call left a short override on this cached connection;
+            # restore the default so it cannot leak into unbounded operations.
+            conn.execute(f"PRAGMA busy_timeout={self._DEFAULT_BUSY_TIMEOUT_MS}")
+            self._local.busy_timeout_ms = self._DEFAULT_BUSY_TIMEOUT_MS
         return conn
 
     def _invalidate_hot_caches(self) -> None:
@@ -812,6 +835,42 @@ class SQLiteHandler:
                         conn.execute("ALTER TABLE packets ADD COLUMN tx_radio_id TEXT")
                         logger.info("Added tx_radio_id column to packets table")
 
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
+                # Migration 17: Arrival sequence for companion queued messages.
+                #
+                # Sync merges the in-memory offline queue and the persisted rows
+                # by this number, so a newer in-memory message cannot overtake
+                # an older persisted one. Existing rows are backfilled with
+                # their id, which already is their arrival order; rows written
+                # later without a number fall back to that same row order when
+                # read.
+                migration_name = "add_arrival_seq_to_companion_messages"
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    cursor = conn.execute("PRAGMA table_info(companion_messages)")
+                    columns = [column[1] for column in cursor.fetchall()]
+
+                    if "arrival_seq" not in columns:
+                        conn.execute(
+                            "ALTER TABLE companion_messages ADD COLUMN arrival_seq INTEGER"
+                        )
+                        logger.info("Added arrival_seq column to companion_messages table")
+
+                    conn.execute(
+                        "UPDATE companion_messages SET arrival_seq = id WHERE arrival_seq IS NULL"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_companion_messages_arrival "
+                        "ON companion_messages(companion_hash, arrival_seq)"
+                    )
                     conn.execute(
                         "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
                         (migration_name, time.time()),
@@ -4161,7 +4220,12 @@ class SQLiteHandler:
             return None
 
     def companion_push_message(
-        self, companion_hash: str, msg: Dict, max_messages: Optional[int] = None
+        self,
+        companion_hash: str,
+        msg: Dict,
+        max_messages: Optional[int] = None,
+        arrival_seq: Optional[int] = None,
+        busy_timeout_ms: Optional[int] = None,
     ) -> bool:
         """Append a message to the companion's queue.
 
@@ -4174,6 +4238,11 @@ class SQLiteHandler:
         policy: evict the oldest channel message first and never displace a
         retained direct message. The insert and any eviction share one
         transaction.
+
+        ``arrival_seq`` is the arrival number the frame server assigned to the
+        message, stored so sync can merge both queues in arrival order. Rows
+        written without one fall back to their row order, which is their
+        arrival order.
 
         Returns True if the message is retained, False if it is a duplicate or
         the protected queue cannot make room for it.
@@ -4188,15 +4257,16 @@ class SQLiteHandler:
             sender_prefix = msg.get("sender_prefix", b"")
             if not isinstance(sender_prefix, str):
                 sender_prefix = bytes(sender_prefix or b"").hex()
-            with self._connect() as conn:
+            with self._connect(busy_timeout_ms) as conn:
                 conn.execute("SAVEPOINT companion_message_push")
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO companion_messages
                     (companion_hash, sender_key, txt_type, timestamp, text,
                      is_channel, channel_idx, path_len, sender_prefix, snr, rssi,
-                     channel_data_type, channel_data_payload, packet_hash, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     channel_data_type, channel_data_payload, packet_hash, created_at,
+                     arrival_seq)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         companion_hash,
@@ -4214,6 +4284,7 @@ class SQLiteHandler:
                         bytes(msg.get("channel_data_payload") or b""),
                         packet_hash,
                         time.time(),
+                        arrival_seq,
                     ),
                 )
                 inserted = cursor.rowcount > 0
@@ -4268,6 +4339,19 @@ class SQLiteHandler:
             logger.error(f"Failed to push companion message: {e}")
             return False
 
+    @staticmethod
+    def _companion_message_from_row(row: sqlite3.Row) -> Dict:
+        """Decode a ``companion_messages`` row into the message dict shape."""
+        msg = dict(row)
+        msg.pop("id", None)
+        prefix = msg.get("sender_prefix") or ""
+        msg["sender_prefix"] = bytes.fromhex(prefix) if isinstance(prefix, str) else bytes(prefix)
+        msg["snr"] = float(msg.get("snr") or 0.0)
+        msg["rssi"] = int(msg.get("rssi") or 0)
+        msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
+        msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
+        return msg
+
     def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
         """Remove and return the oldest message from the companion's queue."""
         try:
@@ -4279,22 +4363,116 @@ class SQLiteHandler:
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
                     FROM companion_messages WHERE companion_hash = ?
-                    ORDER BY id ASC LIMIT 1
+                    ORDER BY COALESCE(arrival_seq, id) ASC LIMIT 1
                 """,
                     (companion_hash,),
                 )
                 row = cursor.fetchone()
                 if not row:
                     return None
-                msg = dict(row)
-                msg["sender_prefix"] = bytes.fromhex(msg.get("sender_prefix") or "")
-                msg["snr"] = float(msg.get("snr") or 0.0)
-                msg["rssi"] = int(msg.get("rssi") or 0)
-                msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
-                msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
-                conn.execute("DELETE FROM companion_messages WHERE id = ?", (msg["id"],))
+                msg = self._companion_message_from_row(row)
+                conn.execute("DELETE FROM companion_messages WHERE id = ?", (row["id"],))
                 conn.commit()
-                return {k: v for k, v in msg.items() if k != "id"}
+                return msg
         except Exception as e:
             logger.error(f"Failed to pop companion message: {e}")
             return None
+
+    def companion_max_arrival_seq(
+        self, companion_hash: str, busy_timeout_ms: Optional[int] = None
+    ) -> Optional[int]:
+        """Return the highest arrival number outstanding for a companion.
+
+        Rows written before the arrival_seq migration have no number; their id
+        (insertion order, which is their arrival order) stands in for one. The
+        frame server seeds its arrival counter above this value after a
+        restart, so new arrivals always sort behind the backlog that is
+        already persisted.
+
+        Returns None when the read fails, so the caller can degrade instead of
+        silently reordering against an unknown backlog.
+        """
+        try:
+            with self._connect(busy_timeout_ms) as conn:
+                row = conn.execute(
+                    """
+                    SELECT MAX(COALESCE(arrival_seq, id)) FROM companion_messages
+                    WHERE companion_hash = ?
+                """,
+                    (companion_hash,),
+                ).fetchone()
+                if row and row[0] is not None:
+                    return int(row[0])
+                return 0
+        except Exception:
+            logger.error(
+                f"Failed to read companion arrival sequence for {companion_hash}", exc_info=True
+            )
+            return None
+
+    def companion_peek_message(
+        self, companion_hash: str, busy_timeout_ms: Optional[int] = None
+    ) -> Optional[tuple[int, Dict]]:
+        """Return the oldest queued message *without* removing it.
+
+        Returns ``(row_id, message)`` so the caller can delete exactly that
+        row once the message has really been handed to the client, or ``None``
+        when the queue is empty. The message dict carries ``arrival_seq``;
+        a row stored without an arrival number reports its row id instead,
+        because the row order is its arrival order.
+
+        The oldest message is the lowest arrival number, not the lowest row
+        id: a persist retried after a locked store lands its row when the
+        lock lifts, so row ids follow insert time while ``arrival_seq``
+        preserves the true arrival order.
+
+        Raises when the read fails, so the caller can fall back rather than
+        treat a locked or broken store as "no messages".
+        """
+        try:
+            with self._connect(busy_timeout_ms) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
+                           path_len, sender_prefix, snr, rssi, channel_data_type,
+                           channel_data_payload, packet_hash, arrival_seq
+                    FROM companion_messages WHERE companion_hash = ?
+                    ORDER BY COALESCE(arrival_seq, id) ASC LIMIT 1
+                """,
+                    (companion_hash,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                msg = self._companion_message_from_row(row)
+                msg["arrival_seq"] = (
+                    int(row["arrival_seq"]) if row["arrival_seq"] is not None else int(row["id"])
+                )
+                return int(row["id"]), msg
+        except Exception:
+            logger.error(f"Failed to peek companion message for {companion_hash}", exc_info=True)
+            raise
+
+    def companion_delete_message(
+        self,
+        companion_hash: str,
+        message_id: int,
+        busy_timeout_ms: Optional[int] = None,
+    ) -> bool:
+        """Delete one queued message by row id.
+
+        Returns True when a row was removed, False when the row was already
+        gone (or the delete failed).
+        """
+        try:
+            with self._connect(busy_timeout_ms) as conn:
+                cursor = conn.execute(
+                    "DELETE FROM companion_messages WHERE id = ? AND companion_hash = ?",
+                    (message_id, companion_hash),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to delete companion message: {e}")
+            return False

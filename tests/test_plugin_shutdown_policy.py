@@ -251,10 +251,15 @@ def test_manager_bounds_the_drain_by_the_granted_deadline():
     manager.stop_all()
     stops = [call for call in runtime.mock_calls if call[0] == "stop"]
     assert len(stops) == 2
-    for stop in stops:
-        assert stop.kwargs["timeout"] < 20
-        # The whole sequential drain still fits inside the granted deadline.
-        assert 2 * (stop.kwargs["timeout"] + 4) + 8 <= 30
+    first, last = stops
+    # Each stop is sized from what the granted deadline still has left when
+    # it starts: the first owes the second plugin's fixed cost as well, the
+    # last only its own cost plus the exit margin. Both keep the whole
+    # sequential drain inside the granted deadline.
+    assert first.kwargs["timeout"] < 20
+    assert 2 * (first.kwargs["timeout"] + 4) + 8 <= 30
+    assert last.kwargs["timeout"] < 20
+    assert (last.kwargs["timeout"] + 4) + 8 <= 30
 
 
 def test_outer_grant_caps_both_waits():

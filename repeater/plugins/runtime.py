@@ -683,19 +683,45 @@ class PluginRuntime:
         finally:
             self._lock.release()
 
+    @staticmethod
+    def _bounded_wait(wait: float | None, deadline: float | None) -> float | None:
+        """Cap one wait at the caller's monotonic deadline, when given.
+
+        ``None`` keeps the caller's own bound for stops that pass no
+        deadline; a bounded stop gets the smaller of its allowance and what
+        the deadline still has left.
+        """
+        if deadline is None:
+            return wait
+        left = max(0.0, float(deadline) - time.monotonic())
+        if wait is None:
+            return left
+        return min(max(0.0, float(wait)), left)
+
+    @staticmethod
+    def _deadline_seconds(cap: float, deadline: float | None) -> float:
+        """A fixed wait cap, reduced to what the caller's deadline has left."""
+        if deadline is None:
+            return cap
+        return min(cap, max(0.0, float(deadline) - time.monotonic()))
+
     def stop(
         self,
         plugin_id: str,
         *,
         mark_disabled: bool = False,
-        timeout: Optional[float] = None,
-        lock_wait: Optional[float] = None,
+        timeout: float | None = None,
+        lock_wait: float | None = None,
+        deadline: float | None = None,
     ) -> PluginState:
         # One stop shares its lock allowance across both acquisitions: the
         # SIGTERM grace between them must not reset the bounded caller's
-        # budget.
+        # budget. ``deadline`` additionally caps every wait — both lock
+        # acquisitions, the SIGTERM grace, the SIGKILL reap and the
+        # log-thread join — at one monotonic instant, so a caller draining
+        # several plugins can bound the whole sequence.
         entered = time.monotonic()
-        with self._runtime_lock(lock_wait):
+        with self._runtime_lock(self._bounded_wait(lock_wait, deadline)):
             handle = self._handles.get(plugin_id)
             self._runtime_state[plugin_id] = (
                 PluginState.DISABLED if mark_disabled else PluginState.STOPPING
@@ -707,13 +733,13 @@ class PluginRuntime:
                 return self._runtime_state[plugin_id]
 
         # Keep the group identity captured at spawn even if the leader exited.
-        self._terminate_handle(handle, timeout=timeout)
+        self._terminate_handle(handle, timeout=timeout, deadline=deadline)
 
         second_wait = (
             None if lock_wait is None else max(0.0, float(lock_wait) - (time.monotonic() - entered))
         )
-        with self._runtime_lock(second_wait):
-            self._cleanup_handle(plugin_id)
+        with self._runtime_lock(self._bounded_wait(second_wait, deadline)):
+            self._cleanup_handle(plugin_id, deadline=deadline)
             self._runtime_state[plugin_id] = (
                 PluginState.DISABLED if mark_disabled else PluginState.STOPPED
             )
@@ -737,11 +763,19 @@ class PluginRuntime:
             else:
                 handle.process.send_signal(sig)
 
-    def _terminate_handle(self, handle: ProcessHandle, *, timeout: Optional[float] = None) -> None:
+    def _terminate_handle(
+        self,
+        handle: ProcessHandle,
+        *,
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> None:
         self._signal_handle(handle, signal.SIGTERM)
         grace = self.stop_timeout if timeout is None else max(0.0, float(timeout))
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
+        if deadline is not None:
+            grace = min(grace, max(0.0, float(deadline) - time.monotonic()))
+        grace_deadline = time.monotonic() + grace
+        while time.monotonic() < grace_deadline:
             handle.process.poll()  # reap the leader, but do not equate it to the group
             if handle.process_group is None:
                 if handle.process.poll() is not None:
@@ -753,8 +787,9 @@ class PluginRuntime:
                     break
             time.sleep(0.05)
         self._signal_handle(handle, signal.SIGKILL)
+        reap_wait = self._deadline_seconds(PROCESS_KILL_TIMEOUT_SECONDS, deadline)
         try:
-            handle.process.wait(timeout=PROCESS_KILL_TIMEOUT_SECONDS)
+            handle.process.wait(timeout=reap_wait)
         except subprocess.TimeoutExpired:
             logger.warning("Plugin %s did not reap after SIGKILL", handle.plugin_id)
 
@@ -762,7 +797,7 @@ class PluginRuntime:
         self.stop(plugin_id)
         return self.start(plugin_id)
 
-    def _cleanup_handle(self, plugin_id: str) -> None:
+    def _cleanup_handle(self, plugin_id: str, *, deadline: float | None = None) -> None:
         handle = self._handles.pop(plugin_id, None)
         if handle is None:
             return
@@ -774,7 +809,8 @@ class PluginRuntime:
         except Exception as exc:
             logger.debug("Could not record exit status for %s: %s", plugin_id, exc)
         if handle.log_thread is not None:
-            handle.log_thread.join(timeout=PROCESS_KILL_TIMEOUT_SECONDS)
+            join_wait = self._deadline_seconds(PROCESS_KILL_TIMEOUT_SECONDS, deadline)
+            handle.log_thread.join(timeout=join_wait)
         try:
             handle.log_fp.close()
         except Exception as exc:

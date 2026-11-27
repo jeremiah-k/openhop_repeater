@@ -22,6 +22,7 @@ from .shutdown_policy import (
     advertised_stop_timeout_seconds,
     check_container_budget,
     check_outer_deadline,
+    effective_stop_budget,
     granted_manager_stop_timeout_seconds,
     managed_shutdown_configured,
     required_container_timeout,
@@ -153,12 +154,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             time.sleep(0.5)
     finally:
         logger.info("Stopping plugin manager")
+        # The drain's deadline starts when the manager is told to stop: the
+        # IPC server's own shutdown and the plugin drain spend the same
+        # granted budget.
+        drain_deadline = time.monotonic() + effective_stop_budget(policy, granted)
         try:
             server.stop()
         except Exception as exc:
             logger.debug("IPC stop: %s", exc)
         try:
-            manager.stop_all()
+            manager.stop_all(deadline=drain_deadline)
         except Exception as exc:
             logger.debug("manager stop_all: %s", exc)
 

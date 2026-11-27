@@ -25,6 +25,8 @@ from .github_releases import (
 from .manifest import ManifestError, load_manifest_from_wheel
 from .runtime import PluginRuntime, PluginState
 from .shutdown_policy import (
+    PLUGIN_STOP_OVERHEAD_SECONDS,
+    SHUTDOWN_MARGIN_SECONDS,
     ShutdownPolicy,
     drain_grace_seconds,
     effective_stop_budget,
@@ -246,7 +248,7 @@ class PluginManager:
                 logger.error("Failed to start enabled plugin %s: %s", plugin_id, exc)
                 self.runtime._runtime_state[plugin_id] = PluginState.FAILED
 
-    def stop_all(self) -> None:
+    def stop_all(self, *, deadline: float | None = None) -> None:
         if self.shutdown_policy is None:
             # Unmanaged installations keep the upstream order: stop the
             # plugins first, then retire crash supervision.
@@ -257,64 +259,91 @@ class PluginManager:
                     logger.debug("stop_all %s: %s", plugin_id, exc)
             self.runtime.stop_supervisor()
             return
-        # Managed drain: retire crash supervision before the first managed
-        # stop. A plugin that crashes while another plugin is being stopped
-        # must not be restarted during the drain: the restart runs outside the
-        # shutdown budget and can rebuild a plugin virtualenv.
+        # Managed drain. One monotonic deadline covers the whole drain —
+        # retiring crash supervision, resolving the running plugins, every
+        # lock wait, every SIGTERM grace, every SIGKILL reap and log-thread
+        # join, and the exit margin. The manager entrypoint anchors it when
+        # the stop signal is received; without one it is anchored here, in
+        # both cases before crash supervision is retired, so the retirement
+        # spends the granted budget like every other drain step.
+        if deadline is None:
+            deadline = time.monotonic() + effective_stop_budget(
+                self.shutdown_policy, self.granted_stop_seconds
+            )
         self.runtime.stop_supervisor()
         plugin_ids = list(self.storage.list_plugin_ids())
         # A restart that was already in flight when the drain began holds the
         # runtime lock while it completes and can take far longer than one
-        # plugin's stop cost. Each stop therefore gets one lock allowance,
-        # sized from what is left of the shutdown budget after its SIGTERM
-        # grace and shared by the stop's two lock acquisitions, so the lock
-        # waits plus the per-plugin grace stay inside the budget. A stop that
-        # cannot take the lock in time is skipped, and the deployment's outer
-        # wait and kill escalation cover the leftover process instead of the
-        # drain overrunning its deadline.
-        deadline = time.monotonic() + effective_stop_budget(
-            self.shutdown_policy, self.granted_stop_seconds
-        )
-        grace = self._drain_grace_seconds(max(0.0, deadline - time.monotonic()))
-        for plugin_id in plugin_ids:
-            remaining = max(0.0, deadline - time.monotonic())
-            lock_wait = remaining if grace is None else max(0.0, remaining - grace)
+        # plugin's stop cost. The running plugins are resolved with one lock
+        # wait that leaves every installed plugin's fixed stop cost and the
+        # exit margin; when the lock cannot be taken in that time, the
+        # installed plugins are counted instead. Each stop then gets one
+        # lock allowance, sized from what is left of the deadline after its
+        # SIGTERM grace and those fixed costs and shared by the stop's two
+        # lock acquisitions, so the lock waits plus the per-plugin grace
+        # stay inside the deadline. A stop that cannot take the lock in time
+        # is skipped, and the deployment's outer wait and kill escalation
+        # cover the leftover process instead of the drain overrunning its
+        # deadline.
+        draining = self._resolve_draining_plugin_ids(plugin_ids, deadline)
+        warned = False
+        for index, plugin_id in enumerate(plugin_ids):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "Shutdown budget spent before %s could be stopped; its "
+                    "process is left to the deployment's outer wait and kill "
+                    "escalation",
+                    plugin_id,
+                )
+                continue
+            pending = self._pending_drain_count(plugin_ids[index:], draining)
+            grace = drain_grace_seconds(self.shutdown_policy, pending, remaining)
+            if grace < self.shutdown_policy.stop_timeout_seconds and not warned:
+                warned = True
+                logger.warning(
+                    "Draining %d managed process(es) within %.0fs of the "
+                    "shutdown budget; per-plugin stop grace reduced from "
+                    "%ds to %ds",
+                    pending,
+                    remaining,
+                    self.shutdown_policy.stop_timeout_seconds,
+                    grace,
+                )
+            lock_wait = max(
+                0.0,
+                remaining
+                - grace
+                - pending * PLUGIN_STOP_OVERHEAD_SECONDS
+                - SHUTDOWN_MARGIN_SECONDS,
+            )
             try:
-                self.runtime.stop(plugin_id, timeout=grace, lock_wait=lock_wait)
+                self.runtime.stop(plugin_id, timeout=grace, lock_wait=lock_wait, deadline=deadline)
             except Exception as exc:
                 logger.debug("stop_all %s: %s", plugin_id, exc)
 
-    def _drain_grace_seconds(self, lock_wait: Optional[float] = None) -> Optional[float]:
-        """Per-plugin SIGTERM grace that keeps the sequential drain bounded.
+    def _resolve_draining_plugin_ids(self, plugin_ids: list[str], deadline: float) -> list[str]:
+        """Resolve the running plugins within the drain's remaining budget.
 
-        The manager stops plugins one after another, so a per-plugin grace
-        sized for a single plugin would let the whole drain overrun the
-        container shutdown timeout and get the manager killed mid-drain.
+        The lock wait leaves every installed plugin's fixed stop cost (the
+        SIGKILL reap and the log-thread join) and the exit margin; the
+        SIGTERM graces shrink to fit whatever the wait leaves. When the lock
+        cannot be taken in that time, the installed plugins are counted
+        instead: the larger count yields the smaller grace, which keeps the
+        drain inside the deadline.
         """
-        policy = self.shutdown_policy
-        if policy is None:
-            return None
+        reserve = len(plugin_ids) * PLUGIN_STOP_OVERHEAD_SECONDS + SHUTDOWN_MARGIN_SECONDS
+        lock_wait = max(0.0, deadline - time.monotonic() - reserve)
         try:
-            draining = self.runtime.running_plugin_ids(lock_wait=lock_wait)
+            return self.runtime.running_plugin_ids(lock_wait=lock_wait)
         except RuntimeError:
-            # A restart still holds the runtime lock. Size the grace from the
-            # installed plugins instead: the larger count yields the smaller
-            # grace, which keeps the drain inside the budget.
-            draining = list(self.storage.list_plugin_ids())
-        if not draining:
-            return None
-        budget = effective_stop_budget(policy, self.granted_stop_seconds)
-        grace = drain_grace_seconds(policy, len(draining), budget)
-        if grace < policy.stop_timeout_seconds:
-            logger.warning(
-                "Draining %d managed process(es) within %ds; per-plugin stop "
-                "grace reduced from %ds to %ds",
-                len(draining),
-                budget,
-                policy.stop_timeout_seconds,
-                grace,
-            )
-        return grace
+            return list(plugin_ids)
+
+    @staticmethod
+    def _pending_drain_count(upcoming: list[str], draining: list[str]) -> int:
+        """How many of the plugins the drain still has to visit are running."""
+        running = set(draining)
+        return sum(1 for plugin_id in upcoming if plugin_id in running)
 
     def list_plugins(self) -> list[dict[str, Any]]:
         result = []

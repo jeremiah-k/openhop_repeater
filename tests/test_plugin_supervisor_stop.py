@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+from repeater.plugins import runtime as runtime_module
 from repeater.plugins.manager import PluginManager
 from repeater.plugins.manifest import PluginManifest, RuntimeSpec
 from repeater.plugins.runtime import PluginRuntime, PluginState
@@ -305,3 +307,77 @@ def test_stop_shares_one_lock_allowance_across_its_two_waits(tmp_path: Path):
     # about 0.5s of SIGTERM grace plus one 0.5s second wait, not the 1.5s an
     # allowance reset after the grace would cost.
     assert 0.9 <= elapsed <= 1.3, f"stop spent {elapsed:.2f}s against a 1.0s allowance"
+
+
+def test_stop_bounds_every_wait_by_the_deadline_it_is_given(tmp_path: Path, monkeypatch):
+    """stop() caps all five of its waits at one monotonic deadline.
+
+    A stuck plugin process, a 5 second stop timeout, a 10 second lock
+    allowance and a 3 second deadline: the SIGTERM grace may only run to the
+    deadline, the SIGKILL reap wait, the second lock acquisition and the
+    log-thread join get only what is left, so one bounded stop never
+    outruns the deadline its caller computed from the drain budget.
+    """
+
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += max(0.0, float(seconds))
+
+    clock = Clock()
+    monkeypatch.setattr(runtime_module, "time", clock)
+
+    class ReapingProc(FakeProc):
+        """Stays live through the SIGTERM grace; the reap consumes its wait."""
+
+        def __init__(self, pid: int):
+            super().__init__(pid)
+            self.process_group = None
+
+        def poll(self):
+            return self._code
+
+        def send_signal(self, sig):
+            # Ignore SIGTERM like a plugin that never drains in time.
+            self.signals.append(sig)
+
+        def kill(self):
+            self.signals.append(signal.SIGKILL)
+            self._code = -9
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                clock.sleep(timeout)
+            return self._code
+
+    procs: list[ReapingProc] = []
+
+    def fake_popen(cmd, **kwargs):
+        proc = ReapingProc(pid=4000 + len(procs))
+        procs.append(proc)
+        return proc
+
+    storage = PluginStorage(tmp_path / "plugins")
+    _install_enabled_plugin(storage)
+    runtime = PluginRuntime(storage, popen_factory=fake_popen)
+    runtime.start("openhop.demo")
+    # Route the fake process through the poll-based termination path so the
+    # stop grace actually elapses instead of exiting on the absent group.
+    runtime._handles["openhop.demo"].process_group = None
+
+    entered = clock.monotonic()
+    state = runtime.stop("openhop.demo", timeout=5, lock_wait=10, deadline=3.0)
+
+    assert state == PluginState.STOPPED
+    assert procs[0].signals == [signal.SIGTERM, signal.SIGKILL]
+    # The SIGTERM grace was cut at the deadline and nothing was left for a
+    # longer reap, second lock wait or log-thread join afterwards.
+    assert 2.9 <= clock.monotonic() - entered <= 3.1, (
+        f"stop spent {clock.monotonic() - entered:.2f}s against a 3s deadline"
+    )
+    assert runtime._handles == {}

@@ -417,8 +417,15 @@ minimum; a larger live process count is not rejected at enable time. When the
 configured container wait cannot fund the plugins enabled at startup, the
 manager logs a warning naming the required seconds and the plugin count. At
 shutdown the manager measures the actual process handles and shares the
-available grace among them. This is best-effort when the outer grant is
-insufficient even for fixed cleanup overhead.
+available grace among them. The drain's deadline starts when the manager is
+told to stop, so the IPC server's shutdown, the retirement of crash
+supervision and every lock wait spend the same budget; each stop's grace and
+lock allowance are sized from what the deadline still has left, always
+keeping the fixed per-plugin reap and join costs and the exit margin. A
+plugin the budget can no longer fund is skipped with a warning naming it,
+and its process is left to the deployment's outer wait and kill escalation.
+This is best-effort when the outer grant is insufficient even for fixed
+cleanup overhead.
 
 The outer deadline must cover the whole ordered stop: the container supervisor
 waits for the plugin manager and then for the repeater, each with the
